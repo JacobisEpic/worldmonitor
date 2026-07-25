@@ -11,7 +11,7 @@
 // truthiness (`!hit.category`) — a truthy non-string (a number, an object,
 // an array) sailed through the assertion and got assigned onto
 // `item.category` untyped. This asymmetry is exactly why
-// buildStoryTrackHsetFields (list-feed-digest.ts:1161) needed a defensive
+// buildStoryTrackHsetFields (same file) needed a defensive
 // `typeof item.category === 'string'` guard downstream — the type was never
 // actually enforced at the point of assignment.
 //
@@ -21,10 +21,26 @@
 // (a valid-shape hit with `category: ''`) is intentionally NOT rejected here
 // — that stays enrichWithAiCache's `!hit.category` truthiness check, so this
 // test file locks the split: shape-validation lives in the parser, value
-// policy (empty/`_skip`) lives in the caller.
+// policy (empty) lives in the caller.
+//
+// `_skip` is the exception to that split, and the tests below pin the real
+// behaviour rather than the intuitive one. The parser does not special-case
+// the sentinel — `{ level: '_skip', category: 'x' }` is a valid shape — but
+// no deployed writer emits that row. Both relay skip-writes are
+// `{ level: '_skip', timestamp }` with NO `category` (scripts/ais-relay.cjs
+// :3892 and :3968), and classify-event.ts's negative path stores the bare
+// string NEG_SENTINEL, never an object. So every production `_skip` row is
+// rejected by the shape check and caught by enrichWithAiCache's `!hit`,
+// which makes its `hit.level === '_skip'` comparison unreachable for real
+// data. Same outcome either way (both `continue`), but the distinction
+// matters if the reject path ever gets logged or metered: skips are normal,
+// high-volume traffic and must not be counted as corruption.
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { __testing__ } from '../server/worldmonitor/news/v1/list-feed-digest';
 
 const { parseClassifyCacheHit } = __testing__;
@@ -47,10 +63,10 @@ describe('parseClassifyCacheHit — valid shapes', () => {
     );
   });
 
-  it('`_skip` is a valid string shape — the sentinel check is the caller\'s job, not the parser\'s', () => {
-    // enrichWithAiCache's `hit.level === '_skip'` check runs on the parsed
-    // result. The validator must not special-case or reject the sentinel
-    // itself, or that downstream check would never see it.
+  it('does not special-case the `_skip` sentinel when a category is present', () => {
+    // The parser is shape-only: it neither rejects nor privileges the
+    // sentinel. Note this row shape is hypothetical — no deployed writer
+    // pairs `_skip` with a category (see the real-shape test below).
     assert.deepStrictEqual(
       parseClassifyCacheHit({ level: '_skip', category: 'general' }),
       { level: '_skip', category: 'general' },
@@ -143,5 +159,51 @@ describe('parseClassifyCacheHit — rejects malformed cache values wholesale', (
 
   it('an empty object → null', () => {
     assert.strictEqual(parseClassifyCacheHit({}), null);
+  });
+
+  it('the REAL relay `_skip` row (no category) → null, so the caller never sees the sentinel', () => {
+    // scripts/ais-relay.cjs:3892 and :3968 both write exactly this shape.
+    // It has no `category`, so the shape check rejects it and
+    // enrichWithAiCache's `!hit` catches it before its `hit.level ===
+    // '_skip'` comparison can ever be true. Locking this here so a future
+    // reject-path log/metric is not written on the assumption that skips
+    // arrive as parsed hits — they do not.
+    assert.strictEqual(parseClassifyCacheHit({ level: '_skip', timestamp: 1 }), null);
+  });
+});
+
+// The cases above verify the guard; this block verifies the guard is
+// actually WIRED IN. Without it, reverting the one call-site line in
+// enrichWithAiCache back to the unchecked `as { level?: string; category?:
+// string }` cast — a merge resolved the wrong way, a "simplify this" edit —
+// leaves parseClassifyCacheHit defined, exported, fully covered, and
+// completely bypassed, with every test above still green. enrichWithAiCache
+// reads Redis directly and is not exported, so a source-level wiring
+// assertion is the cheap lock; same approach as the
+// "list-feed-digest story-identity wiring" block in tests/story-identity.test.mjs.
+describe('parseClassifyCacheHit — call-site wiring (mutation lock)', () => {
+  const digestSrc = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../server/worldmonitor/news/v1/list-feed-digest.ts'),
+    'utf-8',
+  );
+
+  // assert.ok on a precomputed boolean, not assert.match/doesNotMatch on
+  // `digestSrc` — those dump the whole ~60KB file into the failure output.
+  it('enrichWithAiCache routes every cache hit through the validator', () => {
+    assert.ok(
+      // Deliberately not anchored on `const hit =` or the trailing semicolon,
+      // so renaming the local or reformatting the line does not fail this.
+      /parseClassifyCacheHit\(cached\.get\(key\)\)/.test(digestSrc),
+      'enrichWithAiCache must read the classify cache through parseClassifyCacheHit — ' +
+        'the validator is dead weight unless the call site uses it (#3753)',
+    );
+  });
+
+  it('the unchecked cache-result type assertion is not reintroduced', () => {
+    assert.ok(
+      !/cached\.get\(key\)\s+as\s/.test(digestSrc),
+      'cache hits must not be type-asserted back to `{ level?, category? }` — ' +
+        'that unchecked cast IS the #3753 bug this PR fixed',
+    );
   });
 });

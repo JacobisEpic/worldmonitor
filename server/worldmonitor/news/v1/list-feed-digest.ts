@@ -818,6 +818,14 @@ async function enrichWithAiCache(items: ParsedItem[]): Promise<void> {
 
   for (const [key, relatedItems] of keyMap) {
     const hit = parseClassifyCacheHit(cached.get(key));
+    // `hit.level === '_skip'` is currently unreachable and kept only as
+    // defence-in-depth: both relay skip-writes emit `{ level: '_skip',
+    // timestamp }` with no `category` (scripts/ais-relay.cjs:3892, :3968),
+    // so the shape check above already rejects them and `!hit` catches them
+    // here. It stays because it is the correct guard the moment any writer
+    // starts pairing the sentinel with a category — do not read it as the
+    // operative skip check today. Locked by the `_skip` cases in
+    // tests/news-classify-cache-hit-validation.test.mts.
     if (!hit || hit.level === '_skip' || !hit.level || !hit.category) continue;
 
     for (const item of relatedItems) {
