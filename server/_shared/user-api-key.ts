@@ -83,6 +83,7 @@ export async function validateUserApiKey(key: string): Promise<UserKeyResult | n
       CACHE_TTL_SECONDS,
       () => fetchFromConvex(keyHash),
       NEG_TTL_SECONDS,
+      { cacheFetcherErrors: false },
     );
     // null is the legitimate negative-cache / unknown-key answer — pass it
     // through untouched. Anything non-null must prove it carries an identity.
@@ -105,21 +106,42 @@ export async function validateUserApiKey(key: string): Promise<UserKeyResult | n
 async function fetchFromConvex(keyHash: string): Promise<UserKeyResult | null> {
   const convexSiteUrl = process.env.CONVEX_SITE_URL;
   const convexSharedSecret = process.env.CONVEX_SERVER_SHARED_SECRET;
-  if (!convexSiteUrl || !convexSharedSecret) return null;
+  if (!convexSiteUrl || !convexSharedSecret) {
+    throw new Error('Convex user API key validation unavailable: missing-config');
+  }
 
-  const resp = await fetch(`${convexSiteUrl}/api/internal-validate-api-key`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'worldmonitor-gateway/1.0',
-      'x-convex-shared-secret': convexSharedSecret,
-    },
-    body: JSON.stringify({ keyHash }),
-    signal: AbortSignal.timeout(3_000),
-  });
+  let resp: Response;
+  try {
+    resp = await fetch(`${convexSiteUrl}/api/internal-validate-api-key`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'worldmonitor-gateway/1.0',
+        'x-convex-shared-secret': convexSharedSecret,
+      },
+      body: JSON.stringify({ keyHash }),
+      signal: AbortSignal.timeout(3_000),
+    });
+  } catch {
+    throw new Error('Convex user API key validation unavailable: fetch-error');
+  }
 
-  if (!resp.ok) return null;
-  return resp.json() as Promise<UserKeyResult | null>;
+  if (!resp.ok) {
+    throw new Error(`Convex user API key validation unavailable: http-${resp.status}`);
+  }
+
+  let value: unknown;
+  try {
+    value = await resp.json();
+  } catch {
+    throw new Error('Convex user API key validation unavailable: invalid-json');
+  }
+
+  if (value === null) return null;
+  if (!isUserKeyResult(value)) {
+    throw new Error('Convex user API key validation unavailable: invalid-payload');
+  }
+  return value;
 }
 
 /**

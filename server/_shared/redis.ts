@@ -496,9 +496,15 @@ function withFetcherTimeout<T>(promise: Promise<T>, key: string, timeoutMs: numb
  *   value above the caller's internal timeout (LLM `timeoutMs`, aggregated
  *   `UPSTREAM_TIMEOUT_MS` sum) so the cache layer doesn't pre-empt the
  *   caller's own bound. The cache safety net should be the LAST resort.
+ * - `cacheFetcherErrors`: Cache a short negative sentinel when the fetcher
+ *   rejects. Defaults to true. Disable only when an upstream error must remain
+ *   distinguishable from a definitive negative result. The disabled path also
+ *   delegates error logging to the caller so sensitive cache keys are not
+ *   exposed by the helper's default log.
  */
 export interface CachedFetchOpts {
   timeoutMs?: number;
+  cacheFetcherErrors?: boolean;
 }
 
 /**
@@ -558,10 +564,12 @@ export async function cachedFetchJson<T extends object>(
       return result;
     })
     .catch(async (err: unknown) => {
-      const errorTtlSeconds = effectiveFetchErrorNegativeTtlSeconds(negativeTtlSeconds);
-      armLocalNegativeCooldown(key, errorTtlSeconds);
-      await setCachedJson(key, NEG_SENTINEL, errorTtlSeconds);
-      console.warn(`[redis] cachedFetchJson fetcher failed for "${key}":`, errMsg(err));
+      if (opts?.cacheFetcherErrors !== false) {
+        const errorTtlSeconds = effectiveFetchErrorNegativeTtlSeconds(negativeTtlSeconds);
+        armLocalNegativeCooldown(key, errorTtlSeconds);
+        await setCachedJson(key, NEG_SENTINEL, errorTtlSeconds);
+        console.warn(`[redis] cachedFetchJson fetcher failed for "${key}":`, errMsg(err));
+      }
       throw err;
     })
     .finally(() => {

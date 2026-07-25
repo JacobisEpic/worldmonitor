@@ -555,6 +555,66 @@ describe('negative-result caching', { concurrency: 1 }, () => {
     }
   });
 
+  it('retries fetcher errors when error negative caching is disabled', async () => {
+    const redis = await importRedisFresh();
+    const restoreEnv = withEnv({
+      UPSTASH_REDIS_REST_URL: 'https://redis.test',
+      UPSTASH_REDIS_REST_TOKEN: 'token',
+      VERCEL_ENV: undefined,
+      VERCEL_GIT_COMMIT_SHA: undefined,
+    });
+    const originalFetch = globalThis.fetch;
+
+    const store = new Map();
+    let setCalls = 0;
+    globalThis.fetch = async (url, init) => {
+      const raw = String(url);
+      if (raw.includes('/get/')) {
+        const key = decodeURIComponent(raw.split('/get/').pop() || '');
+        return jsonResponse({ result: store.get(key) ?? undefined });
+      }
+      if (isSetRequest(url, init)) {
+        const { key, value } = parseSetRequest(url, init);
+        setCalls += 1;
+        store.set(key, value);
+        return jsonResponse({ result: 'OK' });
+      }
+      throw new Error(`Unexpected fetch URL: ${raw}`);
+    };
+
+    try {
+      let fetcherCalls = 0;
+      const fetcher = async () => {
+        fetcherCalls += 1;
+        if (fetcherCalls === 1) throw new Error('upstream unavailable');
+        return { value: 'recovered' };
+      };
+
+      await assert.rejects(() => redis.cachedFetchJson(
+        'neg:test:no-error-cache',
+        300,
+        fetcher,
+        60,
+        { cacheFetcherErrors: false },
+      ));
+      assert.equal(setCalls, 0, 'fetcher errors must not write a negative sentinel');
+
+      const recovered = await redis.cachedFetchJson(
+        'neg:test:no-error-cache',
+        300,
+        fetcher,
+        60,
+        { cacheFetcherErrors: false },
+      );
+      assert.deepEqual(recovered, { value: 'recovered' });
+      assert.equal(fetcherCalls, 2, 'the next call should retry the fetcher');
+      assert.equal(setCalls, 1, 'only the recovered positive result should be cached');
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv();
+    }
+  });
+
   it('uses in-process cooldown on Redis read errors instead of treating them as plain misses', async () => {
     const redis = await importRedisFresh();
     const restoreEnv = withEnv({
@@ -1967,4 +2027,3 @@ describe('getHashFieldsBatch empty-string handling (#3530)', { concurrency: 1 },
     }
   });
 });
-
