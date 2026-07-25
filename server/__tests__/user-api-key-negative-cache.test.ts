@@ -23,7 +23,7 @@ function response(value: unknown, status = 200): Response {
   });
 }
 
-function installHttpHarness(convexResponses: Response[]) {
+function installHttpHarness(convexResponses: Array<Response | Error>) {
   const redis = new Map<string, string>();
   let convexCalls = 0;
 
@@ -43,6 +43,7 @@ function installHttpHarness(convexResponses: Response[]) {
       convexCalls += 1;
       const next = convexResponses.shift();
       if (!next) throw new Error("Unexpected Convex validation request");
+      if (next instanceof Error) throw next;
       return next;
     }
     throw new Error(`Unexpected fetch URL: ${url}`);
@@ -88,6 +89,20 @@ describe.sequential("validateUserApiKey negative caching", () => {
     expect(warn.mock.calls.flat().join(" ")).not.toContain("user-api-key:");
   });
 
+  test("retries Convex after a fetch rejection and authenticates", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const harness = installHttpHarness([
+      new DOMException("The operation was aborted", "AbortError"),
+      response(VALID_RESULT),
+    ]);
+
+    await expect(validateUserApiKey(VALID_KEY)).resolves.toBeNull();
+    expect([...harness.redis.values()]).not.toContain(JSON.stringify("__WM_NEG__"));
+
+    await expect(validateUserApiKey(VALID_KEY)).resolves.toEqual(VALID_RESULT);
+    expect(harness.convexCalls()).toBe(2);
+  });
+
   test("negative-caches a definitive unknown key", async () => {
     const harness = installHttpHarness([response(null)]);
 
@@ -101,6 +116,23 @@ describe.sequential("validateUserApiKey negative caching", () => {
   test("does not cache a malformed Convex payload as an invalid key", async () => {
     const harness = installHttpHarness([
       response({}),
+      response(VALID_RESULT),
+    ]);
+
+    await expect(validateUserApiKey(VALID_KEY)).resolves.toBeNull();
+    expect([...harness.redis.values()]).not.toContain(JSON.stringify("__WM_NEG__"));
+
+    await expect(validateUserApiKey(VALID_KEY)).resolves.toEqual(VALID_RESULT);
+    expect(harness.convexCalls()).toBe(2);
+  });
+
+  test("retries Convex after an invalid JSON response and authenticates", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const harness = installHttpHarness([
+      new Response("{invalid-json", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
       response(VALID_RESULT),
     ]);
 
