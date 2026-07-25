@@ -26,7 +26,13 @@
 
 import { t } from '@/services/i18n';
 import { getAuthState, subscribeAuthState } from '@/services/auth-state';
+import {
+  claimProActivationPresentation,
+  confirmProActivationPresentation,
+  recordProActivationOutcome,
+} from '@/services/billing';
 import { escapeHtml } from '@/utils/sanitize';
+import { withTimeout } from '@/utils/with-timeout';
 import { getFocusableElements, setTrustedHtml, trustedHtml, type TrustedHtml } from '@/utils/dom-utils';
 import { SITE_VARIANT } from '@/config/variant';
 import {
@@ -42,13 +48,15 @@ import {
   subscribeToPush,
 } from '@/services/push-notifications';
 import { getServerInsights, fetchServerInsights } from '@/services/insights-loader';
-import { loadWidgets } from '@/services/widget-store';
+import { loadWidgets, loadWidgetsStrict } from '@/services/widget-store';
 import {
   ACTIVATION_EVENTS,
   buildActivationSteps,
+  hasAnyActivatedProFunctionality,
   buildBriefDigestPayload,
   buildCriticalAlertsPayload,
   buildExitSummary,
+  buildActivationOutcomeBuckets,
   summarizeActivationExit,
   DEFAULT_DIGEST_HOUR,
   type ActivationEventName,
@@ -74,6 +82,8 @@ export interface ProActivationInterstitialOptions {
   onConfirmStep: (stepId: ActivationStepId) => Promise<'verified' | 'failed'>;
   /** Fire-and-forget skip signal (bookkeeping/telemetry wired by later units). */
   onSkipStep: (stepId: ActivationStepId) => void;
+  /** Called after each durable step-state transition with a full snapshot. */
+  onProgress?: (results: ActivationStepResult[]) => void;
   /** Called exactly once when the flow ends, with the ordered step results. */
   onExit: (results: ActivationStepResult[]) => void;
   /**
@@ -271,6 +281,8 @@ export function openProActivationInterstitial(options: ProActivationInterstitial
 
   const buildResults = (): ActivationStepResult[] =>
     steps.map((step) => ({ id: step.id, outcome: outcomes.get(step.id) ?? defaultOutcome(step) }));
+
+  const recordProgress = (): void => options.onProgress?.(buildResults());
 
   const currentStatus = (step: ActivationStep): StepStatus => {
     if (step.state === 'already-done') return 'verified';
@@ -498,6 +510,7 @@ export function openProActivationInterstitial(options: ProActivationInterstitial
     }
     transient = 'idle';
     currentIndex = steps.length;
+    recordProgress();
     renderModal();
   };
 
@@ -514,6 +527,7 @@ export function openProActivationInterstitial(options: ProActivationInterstitial
   const handleSkip = (step: ActivationStep): void => {
     options.onSkipStep(step.id);
     outcomes.set(step.id, transient === 'failed' ? 'failed' : 'skipped');
+    recordProgress();
     advance();
   };
 
@@ -531,6 +545,7 @@ export function openProActivationInterstitial(options: ProActivationInterstitial
     if (!overlay || generation !== gen) return;
     if (result === 'verified') {
       outcomes.set(step.id, 'confirmed');
+      recordProgress();
       advance();
     } else {
       transient = 'failed';
@@ -590,11 +605,13 @@ export function openProActivationInterstitial(options: ProActivationInterstitial
             break;
           case 'advance-done':
             outcomes.set(step.id, 'done');
+            recordProgress();
             advance();
             break;
           case 'advance-skip':
             options.onSkipStep(step.id);
             outcomes.set(step.id, 'skipped');
+            recordProgress();
             advance();
             break;
         }
@@ -611,6 +628,7 @@ export function openProActivationInterstitial(options: ProActivationInterstitial
           extra.onMount(extrasRoot, {
             confirmAndFinish: () => {
               outcomes.set(step.id, 'confirmed');
+              recordProgress();
               finishFlow();
             },
           });
@@ -692,6 +710,15 @@ export interface ProActivationFlowOptions {
   onEvent?: (event: ActivationEventName, stepId?: ActivationStepId, exit?: ActivationExitSummary) => void;
   /** Injectable clock (tests). Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Markerless first-cycle backfill only: require an authoritative config read
+   * and suppress the flow if any targeted Pro capability is already active.
+   */
+  onlyIfUnactivated?: boolean;
+  /** Opaque subscription identity whose markerless eligibility was evaluated. */
+  expectedActivationKey?: string;
+  /** Per-tab nonce used by the server-side cross-device presentation lease. */
+  activationClaimNonce?: string;
 }
 
 /** Live activation context read once at flow open: config + platform + fields for the alerts patch. */
@@ -709,6 +736,29 @@ export interface ActivationContext {
   hasEnabledRule: boolean;
 }
 
+export interface ProActivationFlowDependencies {
+  readContext: (expectedUserId: string, strict: boolean) => Promise<ActivationContext>;
+  claimPresentation: (
+    activationKey: string,
+    claimNonce: string,
+  ) => Promise<'claimed' | 'not_eligible' | 'already_presented' | 'already_claimed'>;
+  confirmPresentation: (activationKey: string, claimNonce: string) => Promise<boolean>;
+  recordOutcome: (
+    activationKey: string,
+    claimNonce: string,
+    outcome: {
+      confirmedSteps: ActivationStepId[];
+      skippedSteps: ActivationStepId[];
+      failedSteps: ActivationStepId[];
+      revision: number;
+      finalized: boolean;
+    },
+  ) => Promise<boolean>;
+  openInterstitial: typeof openProActivationInterstitial;
+  /** Per-operation deadline; injectable only to keep timeout regressions fast. */
+  operationTimeoutMs?: number;
+}
+
 function isFlowAccountCurrent(options: ProActivationFlowOptions): boolean {
   return options.isAccountCurrent?.() ?? getAuthState().user?.id === options.accountUserId;
 }
@@ -717,6 +767,10 @@ const BRIEF_HOUR_SELECT_ID = 'proActivationDigestHour';
 const DIGEST_CADENCES = new Set(['daily', 'twice_daily', 'weekly']);
 const BRIEF_PREVIEW_MAX = 220;
 const BRIEF_PREVIEW_TIMEOUT_MS = 2500;
+const ACTIVATION_CONTEXT_TIMEOUT_MS = 5_000;
+const ACTIVATION_MUTATION_TIMEOUT_MS = 5_000;
+const PRESENTATION_CONFIRM_RETRY_DELAYS_MS = [250, 750, 1_500] as const;
+const OUTCOME_WRITE_RETRY_DELAYS_MS = [250, 750] as const;
 
 /**
  * The brief step's chosen delivery hour, held outside the re-rendered DOM. The
@@ -753,6 +807,11 @@ function hasUsedPowerFeature(): boolean {
   } catch {
     return false;
   }
+}
+
+/** Strict counterpart for markerless cohort suppression; storage failure retries. */
+function hasUsedPowerFeatureStrict(): boolean {
+  return loadWidgetsStrict().length > 0;
 }
 
 /** Platform capabilities from the live push runtime (drives the alerts-step gate). */
@@ -805,8 +864,16 @@ export function activationContextFromChannelsData(
 }
 
 async function readActivationContextStrict(expectedUserId: string): Promise<ActivationContext> {
-  const data = await getChannelsData(expectedUserId);
-  return activationContextFromChannelsData(data, readActivationCapabilities());
+  const controller = new AbortController();
+  const data = await withTimeout(
+    getChannelsData(expectedUserId, controller.signal),
+    ACTIVATION_CONTEXT_TIMEOUT_MS,
+    'activation-context-read',
+    () => controller.abort(),
+  );
+  const context = activationContextFromChannelsData(data, readActivationCapabilities());
+  context.config.hasUsedPowerFeature = hasUsedPowerFeatureStrict();
+  return context;
 }
 
 export async function readActivationContext(expectedUserId?: string): Promise<ActivationContext> {
@@ -1086,16 +1153,165 @@ function alertsFailedNote(): string {
       });
 }
 
+async function confirmPresentationWithRetry(
+  options: ProActivationFlowOptions,
+  dependencies: ProActivationFlowDependencies,
+): Promise<boolean> {
+  if (!options.expectedActivationKey || !options.activationClaimNonce) return false;
+  for (let attempt = 0; attempt <= PRESENTATION_CONFIRM_RETRY_DELAYS_MS.length; attempt += 1) {
+    if (!isFlowAccountCurrent(options)) return false;
+    try {
+      return await withTimeout(
+        dependencies.confirmPresentation(
+          options.expectedActivationKey,
+          options.activationClaimNonce,
+        ),
+        dependencies.operationTimeoutMs ?? ACTIVATION_MUTATION_TIMEOUT_MS,
+        'activation-confirm-presentation',
+      );
+    } catch (error) {
+      const delay = PRESENTATION_CONFIRM_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined) {
+        console.warn('[pro-activation] failed to confirm presentation', error);
+        return false;
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, delay));
+    }
+  }
+  return false;
+}
+
+function persistActivationOutcomeWithRetry(
+  options: ProActivationFlowOptions,
+  dependencies: ProActivationFlowDependencies,
+  results: readonly ActivationStepResult[],
+  revision: number,
+  finalized: boolean,
+): void {
+  if (!options.onlyIfUnactivated || !options.expectedActivationKey || !options.activationClaimNonce) {
+    return;
+  }
+  const buckets = buildActivationOutcomeBuckets(results);
+  void (async () => {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await withTimeout(
+          dependencies.recordOutcome(
+            options.expectedActivationKey!,
+            options.activationClaimNonce!,
+            {
+              confirmedSteps: [...buckets.confirmedSteps],
+              skippedSteps: [...buckets.skippedSteps],
+              failedSteps: [...buckets.failedSteps],
+              revision,
+              finalized,
+            },
+          ),
+          dependencies.operationTimeoutMs ?? ACTIVATION_MUTATION_TIMEOUT_MS,
+          'activation-record-outcome',
+        );
+        return;
+      } catch (error) {
+        const delay = OUTCOME_WRITE_RETRY_DELAYS_MS[attempt];
+        if (delay === undefined) {
+          console.warn('[pro-activation] failed to record activation outcome', error);
+          return;
+        }
+        await new Promise<void>((resolve) => window.setTimeout(resolve, delay));
+      }
+    }
+  })();
+}
+
 /**
  * Open the full Pro-activation flow: read the subscriber's config, build the
  * ordered steps, wire the real per-step handlers, and on exit decide the
  * finish-setup chip. Safe to await; opens exactly one interstitial.
  */
-export async function openProActivationFlow(options: ProActivationFlowOptions): Promise<boolean> {
-  if (!isFlowAccountCurrent(options)) return false;
-  const ctx = await readActivationContext(options.accountUserId);
-  if (!isFlowAccountCurrent(options)) return false;
+export async function openProActivationFlow(
+  options: ProActivationFlowOptions,
+  injected: Partial<ProActivationFlowDependencies> = {},
+): Promise<'opened' | 'not-eligible' | 'retry'> {
+  const dependencies: ProActivationFlowDependencies = {
+    readContext: (expectedUserId, strict) =>
+      strict
+        ? readActivationContextStrict(expectedUserId)
+        : readActivationContext(expectedUserId),
+    claimPresentation: claimProActivationPresentation,
+    confirmPresentation: confirmProActivationPresentation,
+    recordOutcome: recordProActivationOutcome,
+    openInterstitial: openProActivationInterstitial,
+    ...injected,
+  };
+  if (!isFlowAccountCurrent(options)) return 'retry';
+  let ctx: ActivationContext;
+  try {
+    ctx = await dependencies.readContext(
+      options.accountUserId,
+      options.onlyIfUnactivated === true,
+    );
+  } catch {
+    // Markerless backfill must never turn a failed read into a fabricated
+    // "nothing activated" snapshot. Retry on a later evaluation/boot.
+    return 'retry';
+  }
+  if (!isFlowAccountCurrent(options)) return 'retry';
+  if (
+    options.onlyIfUnactivated &&
+    hasAnyActivatedProFunctionality(ctx.config)
+  ) {
+    return 'not-eligible';
+  }
+  if (options.onlyIfUnactivated) {
+    if (!options.expectedActivationKey || !options.activationClaimNonce) {
+      return 'retry';
+    }
+    let claimStatus;
+    try {
+      claimStatus = await withTimeout(
+        dependencies.claimPresentation(
+          options.expectedActivationKey,
+          options.activationClaimNonce,
+        ),
+        dependencies.operationTimeoutMs ?? ACTIVATION_MUTATION_TIMEOUT_MS,
+        'activation-claim-presentation',
+      );
+    } catch {
+      return 'retry';
+    }
+    if (!isFlowAccountCurrent(options)) return 'retry';
+    if (claimStatus === 'already_claimed') {
+      return 'retry';
+    }
+    if (claimStatus !== 'claimed') {
+      return 'not-eligible';
+    }
+  }
   const steps = buildActivationSteps(ctx.capabilities, ctx.config);
+
+  options.onEvent?.(ACTIVATION_EVENTS.entered);
+
+  // Confirmed BEFORE the interstitial opens -- and therefore before its
+  // onProgress/onExit handlers exist to fire a recordProActivationOutcome
+  // write -- so a lost claim can never leave a presentedAt side effect from a
+  // step the user was never actually given a chance to interact with. This
+  // used to run after openInterstitial below; if a step got confirmed/skipped
+  // in the window before this awaited call resolved and it then failed here,
+  // recordProActivationOutcome's own presentedAt backfill had already fired,
+  // permanently blocking a legitimate re-claim via
+  // claimProActivationPresentation's already_presented check (review finding,
+  // #5584/#5590).
+  if (
+    options.onlyIfUnactivated &&
+    options.expectedActivationKey &&
+    options.activationClaimNonce
+  ) {
+    if (!(await confirmPresentationWithRetry(options, dependencies))) {
+      // A false result means this browser no longer owns the server claim;
+      // repeated transport errors remain retryable under the short lease.
+      return 'retry';
+    }
+  }
 
   // Holds the brief step's delivery-hour pick across the shell's re-renders.
   const selectedHourRef: DigestHourRef = { hour: null };
@@ -1109,10 +1325,19 @@ export async function openProActivationFlow(options: ProActivationFlowOptions): 
   // the confirm button while in-flight (guard the handler itself against a
   // double-fire, e.g. a stray second click before the first await settles).
   const inFlight = new Set<ActivationStepId>();
+  let outcomeRevision = 0;
+  const persistOutcome = (results: readonly ActivationStepResult[], finalized: boolean): void => {
+    outcomeRevision += 1;
+    persistActivationOutcomeWithRetry(
+      options,
+      dependencies,
+      results,
+      outcomeRevision,
+      finalized,
+    );
+  };
 
-  options.onEvent?.(ACTIVATION_EVENTS.entered);
-
-  openProActivationInterstitial({
+  dependencies.openInterstitial({
     steps,
     accountEmail: options.accountEmail,
     stepExtras,
@@ -1136,8 +1361,13 @@ export async function openProActivationFlow(options: ProActivationFlowOptions): 
       }
     },
     onSkipStep: (stepId) => options.onEvent?.(ACTIVATION_EVENTS.stepSkipped, stepId),
+    onProgress: (results) => persistOutcome(results, false),
     onExit: (results) => {
       options.onEvent?.(ACTIVATION_EVENTS.exit, undefined, summarizeActivationExit(results));
+      // Freeze the latest durable snapshot. Progress was already recorded as
+      // steps resolved, so a tab close before this best-effort write cannot
+      // erase engagement from the cohort.
+      persistOutcome(results, true);
       // Chip decision + all localStorage live in the chip module (lazy-imported
       // to keep this component ↔ chip pair free of a static import cycle).
       void import('@/components/ProActivationChip')
@@ -1154,5 +1384,5 @@ export async function openProActivationFlow(options: ProActivationFlowOptions): 
       if (!isFlowAccountCurrent(options)) closeProActivationInterstitial();
     });
   });
-  return true;
+  return 'opened';
 }
