@@ -20,6 +20,7 @@ import {
 } from '@/services/notification-channels';
 import { getCurrentClerkUser } from '@/services/clerk';
 import { hasTier } from '@/services/entitlements';
+import { t } from '@/services/i18n';
 import { getMarketWatchlistEntries } from '@/services/market-watchlist';
 import { SITE_VARIANT } from '@/config/variant';
 import { mountCountryChipPicker, loadFollowedCountriesSafe, type CountryChipPickerHandle } from '@/utils/country-chip-picker';
@@ -71,8 +72,64 @@ function appendNotificationError(rowEl: HTMLElement, message: string): void {
   rowEl.querySelector('.us-notif-error')?.remove();
   const errorEl = document.createElement('span');
   errorEl.className = 'us-notif-error';
+  errorEl.setAttribute('role', 'alert');
   errorEl.textContent = message;
   rowEl.appendChild(errorEl);
+}
+
+type WebPushSettingsState = 'available' | 'denied' | 'unsupported';
+
+function browserPushBlockedMessage(): string {
+  return t('components.proActivation.steps.alerts.blockedNote', {
+    defaultValue:
+      "Notifications are blocked in your browser. Turn them on in your browser's site settings to get alerts.",
+  });
+}
+
+async function readWebPushSettingsState(): Promise<WebPushSettingsState> {
+  try {
+    const { getPushPermission, isWebPushSupported } = await import('@/services/push-notifications');
+    if (!isWebPushSupported()) return 'unsupported';
+    return getPushPermission() === 'denied' ? 'denied' : 'available';
+  } catch {
+    return 'unsupported';
+  }
+}
+
+function showWebPushBlockedState(rowEl: HTMLElement): void {
+  rowEl.dataset.webPushState = 'denied';
+  rowEl.querySelector('.us-notif-error')?.remove();
+  const sub = rowEl.querySelector<HTMLElement>('.us-notif-ch-sub');
+  if (sub) {
+    sub.textContent = browserPushBlockedMessage();
+    sub.classList.add('us-notif-ch-sub-wrap');
+    sub.setAttribute('role', 'status');
+  }
+  const actions = rowEl.querySelector<HTMLElement>('.us-notif-ch-actions');
+  if (actions) {
+    const badge = document.createElement('span');
+    badge.className = 'us-notif-ch-badge us-notif-ch-badge-blocked';
+    badge.textContent = 'Blocked';
+    actions.replaceChildren(badge);
+  }
+}
+
+function showWebPushUnsupportedState(rowEl: HTMLElement): void {
+  rowEl.dataset.webPushState = 'unsupported';
+  rowEl.querySelector('.us-notif-error')?.remove();
+  const sub = rowEl.querySelector<HTMLElement>('.us-notif-ch-sub');
+  if (sub) {
+    sub.textContent = 'This browser or in-app webview does not support web push notifications.';
+    sub.classList.add('us-notif-ch-sub-wrap');
+    sub.removeAttribute('role');
+  }
+  const actions = rowEl.querySelector<HTMLElement>('.us-notif-ch-actions');
+  if (actions) {
+    const badge = document.createElement('span');
+    badge.className = 'us-notif-ch-badge';
+    badge.textContent = 'Not supported';
+    actions.replaceChildren(badge);
+  }
 }
 
 function getTelegramBotUsername(): string {
@@ -146,9 +203,30 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
 
       const CHANNEL_LABELS: Record<ChannelType, string> = { telegram: 'Telegram', email: 'Email', slack: 'Slack', discord: 'Discord', webhook: 'Webhook', web_push: 'Browser Push' };
 
-      function renderChannelRow(channel: NotificationChannel | null, type: ChannelType): string {
+      function renderChannelRow(
+        channel: NotificationChannel | null,
+        type: ChannelType,
+        webPushState: WebPushSettingsState,
+      ): string {
         const icon = channelIcon(type);
         const name = CHANNEL_LABELS[type];
+
+        if (type === 'web_push' && webPushState === 'denied') {
+          const removeAction = channel?.verified
+            ? '<button type="button" class="us-notif-ch-btn us-notif-disconnect" data-channel="web_push">Remove</button>'
+            : '';
+          return `<div class="us-notif-ch-row" data-channel-type="web_push" data-web-push-state="denied">
+            <div class="us-notif-ch-icon">${icon}</div>
+            <div class="us-notif-ch-body">
+              <div class="us-notif-ch-name">${name}</div>
+              <div class="us-notif-ch-sub us-notif-ch-sub-wrap" role="status">${escapeHtml(browserPushBlockedMessage())}</div>
+            </div>
+            <div class="us-notif-ch-actions">
+              <span class="us-notif-ch-badge us-notif-ch-badge-blocked">Blocked</span>
+              ${removeAction}
+            </div>
+          </div>`;
+        }
 
         if (channel?.verified) {
           let sub: string;
@@ -262,7 +340,19 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         }
 
         if (type === 'web_push') {
-          return `<div class="us-notif-ch-row" data-channel-type="web_push">
+          if (webPushState === 'unsupported') {
+            return `<div class="us-notif-ch-row" data-channel-type="web_push" data-web-push-state="unsupported">
+              <div class="us-notif-ch-icon">${icon}</div>
+              <div class="us-notif-ch-body">
+                <div class="us-notif-ch-name">${name}</div>
+                <div class="us-notif-ch-sub us-notif-ch-sub-wrap">This browser or in-app webview does not support web push notifications.</div>
+              </div>
+              <div class="us-notif-ch-actions">
+                <span class="us-notif-ch-badge">Not supported</span>
+              </div>
+            </div>`;
+          }
+          return `<div class="us-notif-ch-row" data-channel-type="web_push" data-web-push-state="available">
             <div class="us-notif-ch-icon">${icon}</div>
             <div class="us-notif-ch-body">
               <div class="us-notif-ch-name">${name}</div>
@@ -279,7 +369,10 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
 
       const detectedTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-      function renderNotifContent(data: Awaited<ReturnType<typeof getChannelsData>>): string {
+      function renderNotifContent(
+        data: Awaited<ReturnType<typeof getChannelsData>>,
+        webPushState: WebPushSettingsState,
+      ): string {
         const channelTypes: ChannelType[] = ['telegram', 'email', 'slack', 'discord', 'webhook', 'web_push'];
         const alertRule = data.alertRules?.[0] ?? null;
         const sensitivity = alertRule?.sensitivity ?? 'all';
@@ -287,7 +380,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         let html = '<div class="ai-flow-section-label">Channels</div>';
         for (const type of channelTypes) {
           const channel = data.channels.find(c => c.channelType === type) ?? null;
-          html += renderChannelRow(channel, type);
+          html += renderChannelRow(channel, type, webPushState);
         }
 
         const qhEnabled = alertRule?.quietHoursEnabled ?? false;
@@ -475,9 +568,12 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         loadingEl.style.display = 'block';
         contentEl.style.display = 'none';
         if (signal.aborted) return;
-        getChannelsData(undefined, signal).then((data) => {
+        Promise.all([
+          getChannelsData(undefined, signal),
+          readWebPushSettingsState(),
+        ]).then(([data, webPushState]) => {
           if (signal.aborted) return;
-          setTrustedHtml(contentEl, trustedHtml(renderNotifContent(data), "legacy direct innerHTML migration"));
+          setTrustedHtml(contentEl, trustedHtml(renderNotifContent(data, webPushState), "legacy direct innerHTML migration"));
           loadingEl.style.display = 'none';
           contentEl.style.display = 'block';
 
@@ -1011,28 +1107,46 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
 
         if (target.closest('#usConnectWebPush')) {
           const btn = target.closest<HTMLButtonElement>('#usConnectWebPush');
+          const rowEl = btn?.closest<HTMLElement>('[data-channel-type="web_push"]') ?? null;
           if (btn) {
             btn.disabled = true;
             btn.textContent = 'Requesting…';
           }
           (async () => {
+            let pushRuntime: typeof import('@/services/push-notifications') | null = null;
             try {
-              const { subscribeToPush, isWebPushSupported } = await import('@/services/push-notifications');
-              if (!isWebPushSupported()) {
-                if (btn) {
-                  btn.disabled = false;
-                  btn.textContent = 'Not supported';
-                  btn.setAttribute('title', 'This browser (or in-app webview) does not support web push notifications.');
-                }
+              pushRuntime = await import('@/services/push-notifications');
+              if (!pushRuntime.isWebPushSupported()) {
+                if (rowEl && !signal.aborted) showWebPushUnsupportedState(rowEl);
                 return;
               }
-              await subscribeToPush();
+              if (pushRuntime.getPushPermission() === 'denied') {
+                if (rowEl && !signal.aborted) showWebPushBlockedState(rowEl);
+                return;
+              }
+              await pushRuntime.subscribeToPush();
               if (!signal.aborted) { saveRuleWithNewChannel('web_push'); reloadNotifSection(); }
             } catch (err) {
               console.warn('[notif] web_push subscribe failed:', err);
-              if (btn && !signal.aborted) {
+              if (signal.aborted) return;
+              const permission = pushRuntime?.getPushPermission();
+              if (permission === 'denied') {
+                if (rowEl) showWebPushBlockedState(rowEl);
+                return;
+              }
+              if (pushRuntime && !pushRuntime.isWebPushSupported()) {
+                if (rowEl) showWebPushUnsupportedState(rowEl);
+                return;
+              }
+              if (btn) {
                 btn.disabled = false;
                 btn.textContent = 'Enable';
+              }
+              if (rowEl) {
+                appendNotificationError(
+                  rowEl,
+                  'Could not enable browser notifications. Try again.',
+                );
               }
             }
           })();
