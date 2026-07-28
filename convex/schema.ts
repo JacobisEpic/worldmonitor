@@ -637,9 +637,15 @@ export default defineSchema({
     // "your access ended ~a month ago", so access end is the right clock.
     .index("by_status_currentPeriodEnd", ["status", "currentPeriodEnd"]),
 
-  // Cross-device single-presentation lease for markerless Pro activation.
-  // A short pending claim closes concurrent mount races without permanently
-  // suppressing onboarding when a browser crashes before rendering the flow.
+  // What happened in a Pro-activation session, one row per subscription per
+  // cohort (see `cohort` below).
+  //
+  // For the markerless retro cohort the row is ALSO a cross-device
+  // single-presentation lease: a short pending claim closes concurrent mount
+  // races without permanently suppressing onboarding when a browser crashes
+  // before rendering the flow. The day-0 cohort has no lease — its fire-once
+  // is the browser-local checkout marker — so its row is purely the outcome
+  // record.
   //
   // The outcome buckets mirror ActivationStepOutcome
   // (pro-activation-state.ts). They are updated as the subscriber acts so a
@@ -648,8 +654,23 @@ export default defineSchema({
   proActivationPresentations: defineTable({
     userId: v.string(),
     subscriptionId: v.id("subscriptions"),
+    // Which activation cohort this row records (#5621). ABSENT is the
+    // markerless retro backfill — the only cohort that existed before, so
+    // every pre-#5621 row reads correctly with no backfill, and the lease
+    // lookups keep matching them by querying `cohort: undefined`.
+    // "day0" is the post-checkout welcome session. The two are SEPARATE rows
+    // for one subscription on purpose: day-0 carries no lease (its fire-once
+    // is the browser-local checkout marker), so a day-0 row must never occupy
+    // the retro claim slot or set the `presentedAt` gate that suppresses a
+    // later legitimate backfill for a subscriber whose day-0 writes all
+    // failed (#5600).
+    cohort: v.optional(v.literal("day0")),
     claimNonce: v.string(),
     claimedAt: v.number(),
+    // Day-0 only: client-generated session start used with claimNonce as a
+    // total ownership order. Optional so rows written before the ordered
+    // takeover contract deploy without a backfill.
+    sessionStartedAt: v.optional(v.number()),
     presentedAt: v.optional(v.number()),
     // Set when a presentation is confirmed by an outcome-aware client. This
     // excludes rows created before #5582 without losing post-deploy sessions
@@ -657,12 +678,26 @@ export default defineSchema({
     outcomeTrackingVersion: v.optional(v.literal(1)),
     confirmedSteps: v.optional(v.array(proActivationStepIdValidator)),
     skippedSteps: v.optional(v.array(proActivationStepIdValidator)),
+    // Browser-refused steps (#5617). A separate bucket rather than a marker on
+    // `skippedSteps` so rows written before it existed stay valid and every
+    // existing consumer of the original three keeps its exact meaning.
+    //
+    // ROLLBACK: once any row has this field populated, deleting this line fails
+    // the Convex deploy — schema validation rejects a stored field the
+    // validator does not declare. To revert, revert the WRITE path (the client
+    // and the mutation arg) and leave this field in place; drop it only after
+    // the surviving rows have aged out.
+    blockedSteps: v.optional(v.array(proActivationStepIdValidator)),
     failedSteps: v.optional(v.array(proActivationStepIdValidator)),
     outcomeRevision: v.optional(v.number()),
     outcomeUpdatedAt: v.optional(v.number()),
     exitedAt: v.optional(v.number()),
   })
-    .index("by_subscription", ["subscriptionId"]),
+    // Cohort is part of the key so each lookup names the row it means. A
+    // prefix query on `subscriptionId` alone still reads BOTH cohorts (used
+    // by subscription deletion); every lease/outcome lookup pins the second
+    // component so it can never cross cohorts.
+    .index("by_subscription_cohort", ["subscriptionId", "cohort"]),
 
   // Dunning/winback send ledger (#4932): one row per email step actually
   // delivered for a given subscription episode. `episodeAt` is the on_hold
@@ -710,6 +745,11 @@ export default defineSchema({
       // validator MUST accept it or the webhook's entitlement write is
       // rejected (v.object is strict on extra keys).
       apiDailyAllowance: v.optional(v.number()),
+      // Optional — data-export entitlement (plan 2026-07-25-001). Legacy rows
+      // predate it; consumers treat undefined on a tier >= 2 row as entitled
+      // (fail-OPEN, permanently — see the PlanFeatures JSDoc). Catalog-sourced
+      // writes always set it, so this validator MUST accept it.
+      dataExport: v.optional(v.boolean()),
     }),
     validUntil: v.number(),
     // Optional complimentary-entitlement floor. When set and in the future,

@@ -1,4 +1,10 @@
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
+
+const {
+  parseProxyConfig,
+  proxyFetch,
+} = createRequire(import.meta.url)('../_proxy-utils.cjs');
 
 export const CROSS_STRAIT_ACTIVITY_KEY = 'military:cross-strait-activity:v1';
 export const MND_MAX_LIST_PAGES_PER_BACKFILL_RUN = 11;
@@ -23,6 +29,7 @@ const MND_REFRESH_ROTATION_INTERVAL_MS = 3 * 60 * 60 * 1_000;
 const DAY_MS = 86_400_000;
 const MAX_PERSISTED_STRING_LENGTH = 2_048;
 const MAX_SOURCE_URL_LENGTH = 512;
+const PROXY_DIAGNOSTIC_MAX_CHARS = 256;
 
 function monotonicNow() {
   return globalThis.performance.now();
@@ -71,16 +78,20 @@ export const CROSS_STRAIT_SOURCE_CONTRACTS = Object.freeze({
     redirectPolicy: 'error',
     maxResponseBytes: JMOD_MAX_RESPONSE_BYTES,
     requestCadenceMs: REQUEST_CADENCE_MS,
+    // Documents the fixed one-direct-then-one-proxy flow hard-coded in
+    // fetchJapanIndexOutcome; these bounds are not read back to drive it.
+    maxRequestsPerRun: 2,
+    maxDirectRequestsPerRun: 1,
+    maxProxyRequestsPerRun: 1,
+    fallbackPolicy: 'direct_then_proxy_on_transport_failure',
     documentAdmission: 'manual_review_required',
     runtimePdfRequestsPerRun: 0,
     preflight: Object.freeze({
       environment: 'railway-production',
-      checkedAt: '2026-07-25',
-      reachable: true,
+      checkedAt: '2026-07-26',
+      reachable: false,
       redirectCount: 0,
-      observedIndexStatus: 206,
-      observedPdfStatus: 206,
-      largestObservedBytes: 400_725,
+      observedIndexStatus: 403,
     }),
   }),
 });
@@ -287,13 +298,837 @@ export const REVIEWED_JAPAN_MOD_OBSERVATIONS = Object.freeze([
   }),
 ]);
 
+const HTML_HIDDEN_CONTENT_ELEMENTS = new Set([
+  'audio',
+  'canvas',
+  'datalist',
+  'iframe',
+  'meter',
+  'noembed',
+  'noframes',
+  'noscript',
+  'progress',
+  'rp',
+  'script',
+  'style',
+  'template',
+  'title',
+  'video',
+]);
+const HTML_RAW_TEXT_ELEMENTS = new Set([
+  'iframe',
+  'noembed',
+  'noframes',
+  'noscript',
+  'script',
+  'style',
+  'textarea',
+  'title',
+  'xmp',
+]);
+const HTML_VOID_ELEMENTS = new Set([
+  'area',
+  'base',
+  'br',
+  'col',
+  'embed',
+  'hr',
+  'img',
+  'input',
+  'link',
+  'meta',
+  'param',
+  'source',
+  'track',
+  'wbr',
+]);
+const HTML_P_IMPLICIT_CLOSE_STARTS = new Set([
+  'address',
+  'article',
+  'aside',
+  'blockquote',
+  'center',
+  'details',
+  'dialog',
+  'dir',
+  'div',
+  'dl',
+  'fieldset',
+  'figcaption',
+  'figure',
+  'footer',
+  'form',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'header',
+  'hgroup',
+  'hr',
+  'main',
+  'menu',
+  'nav',
+  'ol',
+  'p',
+  'pre',
+  'search',
+  'section',
+  'summary',
+  'table',
+  'ul',
+]);
+const HTML_ELEMENT_SCOPE_BOUNDARIES = new Set([
+  'annotation-xml',
+  'applet',
+  'caption',
+  'desc',
+  'foreignobject',
+  'html',
+  'marquee',
+  'mi',
+  'mn',
+  'mo',
+  'ms',
+  'mtext',
+  'object',
+  'table',
+  'td',
+  'template',
+  'th',
+  'title',
+]);
+const HTML_BUTTON_SCOPE_BOUNDARIES = new Set([
+  ...HTML_ELEMENT_SCOPE_BOUNDARIES,
+  'button',
+]);
+const HTML_TAG_SPECIFIC_END_ELEMENTS = new Set([
+  'address',
+  'article',
+  'aside',
+  'blockquote',
+  'button',
+  'center',
+  'details',
+  'dialog',
+  'dir',
+  'div',
+  'dl',
+  'fieldset',
+  'figcaption',
+  'figure',
+  'footer',
+  'form',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'header',
+  'hgroup',
+  'li',
+  'listing',
+  'main',
+  'menu',
+  'nav',
+  'ol',
+  'pre',
+  'search',
+  'section',
+  'summary',
+  'ul',
+]);
+const HTML_SPECIAL_ELEMENTS = new Set([
+  ...HTML_TAG_SPECIFIC_END_ELEMENTS,
+  ...HTML_ELEMENT_SCOPE_BOUNDARIES,
+  'area',
+  'base',
+  'basefont',
+  'bgsound',
+  'body',
+  'br',
+  'col',
+  'colgroup',
+  'dd',
+  'dt',
+  'embed',
+  'frame',
+  'frameset',
+  'head',
+  'hr',
+  'iframe',
+  'img',
+  'input',
+  'link',
+  'meta',
+  'noembed',
+  'noframes',
+  'noscript',
+  'param',
+  'plaintext',
+  'script',
+  'select',
+  'source',
+  'style',
+  'tbody',
+  'textarea',
+  'tfoot',
+  'thead',
+  'tr',
+  'track',
+  'wbr',
+  'xmp',
+]);
+
+function startTagImplicitlyCloses(openElement, tag) {
+  // Only recover paragraph omission here. Other optional-end-tag rules are
+  // scope-sensitive (for example a nested <li> inside <ul> must not close an
+  // outer hidden <li>), so treating them without a full tree builder could
+  // expose hidden claims. Conservatively retain those subtrees instead.
+  return openElement === 'p' && !tag.isClosing && HTML_P_IMPLICIT_CLOSE_STARTS.has(tag.name);
+}
+
+function shouldHideHtmlElement(tag) {
+  return !tag.isClosing
+    && !HTML_VOID_ELEMENTS.has(tag.name)
+    && (
+      HTML_HIDDEN_CONTENT_ELEMENTS.has(tag.name)
+      || (tag.name === 'dialog' && !hasHtmlAttribute(tag.openingTag, 'open'))
+      || hasHtmlAttribute(tag.openingTag, 'hidden')
+      || hasHtmlAttribute(tag.openingTag, 'popover')
+    );
+}
+
+function isHtmlElementTag(tag) {
+  return !tag.isComment && !tag.isMalformed && /^[a-z]/i.test(tag.name);
+}
+
+function createHtmlStack() {
+  return {
+    items: [],
+    positions: new Map(),
+    elementScopeBoundaries: [],
+    buttonScopeBoundaries: [],
+    specialElements: [],
+  };
+}
+
+function pushHtmlStack(stack, name) {
+  const index = stack.items.length;
+  stack.items.push(name);
+  const positions = stack.positions.get(name) ?? [];
+  positions.push(index);
+  stack.positions.set(name, positions);
+  if (HTML_ELEMENT_SCOPE_BOUNDARIES.has(name)) {
+    stack.elementScopeBoundaries.push(index);
+  }
+  if (HTML_BUTTON_SCOPE_BOUNDARIES.has(name)) {
+    stack.buttonScopeBoundaries.push(index);
+  }
+  if (HTML_SPECIAL_ELEMENTS.has(name)) {
+    stack.specialElements.push(index);
+  }
+}
+
+function truncateHtmlStack(stack, length) {
+  while (stack.items.length > length) {
+    const index = stack.items.length - 1;
+    const name = stack.items.pop();
+    const positions = stack.positions.get(name);
+    positions.pop();
+    if (positions.length === 0) stack.positions.delete(name);
+    if (stack.elementScopeBoundaries.at(-1) === index) {
+      stack.elementScopeBoundaries.pop();
+    }
+    if (stack.buttonScopeBoundaries.at(-1) === index) {
+      stack.buttonScopeBoundaries.pop();
+    }
+    if (stack.specialElements.at(-1) === index) {
+      stack.specialElements.pop();
+    }
+  }
+}
+
+function htmlStackLastIndex(stack, name) {
+  return stack.positions.get(name)?.at(-1) ?? -1;
+}
+
+function hasElementScopeBoundary(stack, startIndex = 0) {
+  return (stack.elementScopeBoundaries.at(-1) ?? -1) >= startIndex;
+}
+
+function hasButtonScopeBoundary(stack, startIndex = 0) {
+  return (stack.buttonScopeBoundaries.at(-1) ?? -1) >= startIndex;
+}
+
+function hiddenEndTagHasBarrier(stack, element) {
+  if (element === 'p') return hasButtonScopeBoundary(stack);
+  if (HTML_TAG_SPECIFIC_END_ELEMENTS.has(element)) {
+    return hasElementScopeBoundary(stack);
+  }
+  return stack.specialElements.length > 0;
+}
+
+function recoverRepeatedButtonStart(stack, tag) {
+  if (tag.isClosing || tag.name !== 'button') return;
+  const buttonIndex = htmlStackLastIndex(stack, 'button');
+  if (
+    buttonIndex !== -1
+    && !hasButtonScopeBoundary(stack, buttonIndex + 1)
+  ) {
+    truncateHtmlStack(stack, buttonIndex);
+  }
+}
+
+function stripHtmlTags(value) {
+  const input = String(value);
+  const output = [];
+  let cursor = 0;
+  let hiddenElement = null;
+  let hiddenDepth = 0;
+  let hiddenDescendantStack = createHtmlStack();
+  let closedDetailsDepth = 0;
+  let closedDetailsSummarySeen = false;
+  let closedDetailsSummaryVisible = false;
+  let closedDetailsHiddenStack = createHtmlStack();
+  let formElementActive = false;
+  let templateDepth = 0;
+  for (const tag of scanHtmlTags(input)) {
+    const insideTemplate = templateDepth > 0;
+    if (isHtmlElementTag(tag) && tag.name === 'template') {
+      templateDepth = tag.isClosing
+        ? Math.max(0, templateDepth - 1)
+        : templateDepth + 1;
+    }
+    const ignoredNestedFormStart = !insideTemplate
+      && isHtmlElementTag(tag)
+      && tag.name === 'form'
+      && !tag.isClosing
+      && formElementActive;
+    if (
+      !insideTemplate
+      && isHtmlElementTag(tag)
+      && tag.name === 'form'
+      && !ignoredNestedFormStart
+    ) {
+      formElementActive = !tag.isClosing;
+    }
+
+    if (hiddenElement) {
+      if (
+        hiddenDepth === 1
+        && !ignoredNestedFormStart
+        && startTagImplicitlyCloses(hiddenElement, tag)
+        && !hasButtonScopeBoundary(hiddenDescendantStack)
+      ) {
+        hiddenElement = null;
+        hiddenDepth = 0;
+        hiddenDescendantStack = createHtmlStack();
+        cursor = tag.start;
+      } else {
+        if (ignoredNestedFormStart) continue;
+        if (tag.name === hiddenElement) {
+          if (
+            tag.isClosing
+            && hiddenDepth === 1
+            && hiddenEndTagHasBarrier(hiddenDescendantStack, hiddenElement)
+          ) {
+            continue;
+          }
+          if (tag.isClosing) hiddenDepth -= 1;
+          else hiddenDepth += 1;
+          if (hiddenDepth === 0) {
+            hiddenElement = null;
+            hiddenDescendantStack = createHtmlStack();
+            cursor = tag.end + 1;
+          }
+        } else if (
+          isHtmlElementTag(tag)
+          && !tag.isClosing
+          && !HTML_VOID_ELEMENTS.has(tag.name)
+        ) {
+          recoverRepeatedButtonStart(hiddenDescendantStack, tag);
+          pushHtmlStack(hiddenDescendantStack, tag.name);
+        } else if (isHtmlElementTag(tag) && tag.isClosing) {
+          const matchingIndex = htmlStackLastIndex(hiddenDescendantStack, tag.name);
+          if (matchingIndex !== -1) truncateHtmlStack(hiddenDescendantStack, matchingIndex);
+        }
+        continue;
+      }
+    }
+
+    if (closedDetailsDepth > 0) {
+      if (closedDetailsSummaryVisible) {
+        output.push(input.slice(cursor, tag.start));
+        if (ignoredNestedFormStart) {
+          cursor = tag.end + 1;
+          continue;
+        }
+        if (tag.name === 'summary' && tag.isClosing && closedDetailsDepth === 1) {
+          output.push(' ');
+          closedDetailsSummaryVisible = false;
+          cursor = tag.end + 1;
+          continue;
+        }
+        if (
+          shouldHideHtmlElement(tag)
+          || (
+            tag.name === 'details'
+            && !tag.isClosing
+            && !hasHtmlAttribute(tag.openingTag, 'open')
+          )
+        ) {
+          hiddenElement = tag.name;
+          hiddenDepth = 1;
+          hiddenDescendantStack = createHtmlStack();
+          cursor = tag.end + 1;
+          continue;
+        }
+        if (tag.name === 'details') {
+          if (tag.isClosing) closedDetailsDepth -= 1;
+          else closedDetailsDepth += 1;
+          if (closedDetailsDepth === 0) {
+            closedDetailsSummarySeen = false;
+            closedDetailsSummaryVisible = false;
+            closedDetailsHiddenStack = createHtmlStack();
+            cursor = tag.end + 1;
+            continue;
+          }
+        }
+        if (!tag.isComment) {
+          output.push(tag.name === 'br' || (tag.name === 'p' && tag.isClosing) ? '\n' : ' ');
+        }
+        cursor = tag.end + 1;
+        continue;
+      }
+
+      if (ignoredNestedFormStart) continue;
+      if (tag.name === 'details') {
+        if (
+          tag.isClosing
+          && hasElementScopeBoundary(closedDetailsHiddenStack)
+        ) {
+          continue;
+        }
+        if (tag.isClosing) closedDetailsDepth -= 1;
+        else closedDetailsDepth += 1;
+        if (closedDetailsDepth === 0) {
+          closedDetailsSummarySeen = false;
+          closedDetailsHiddenStack = createHtmlStack();
+          cursor = tag.end + 1;
+        }
+        continue;
+      }
+      if (!tag.isClosing && startTagImplicitlyCloses('p', tag)) {
+        const paragraphIndex = htmlStackLastIndex(closedDetailsHiddenStack, 'p');
+        if (
+          paragraphIndex !== -1
+          && !hasButtonScopeBoundary(closedDetailsHiddenStack, paragraphIndex + 1)
+        ) {
+          truncateHtmlStack(closedDetailsHiddenStack, paragraphIndex);
+        }
+      }
+      if (
+        closedDetailsDepth === 1
+        && !closedDetailsSummarySeen
+        && closedDetailsHiddenStack.items.length === 0
+        && tag.name === 'summary'
+        && !tag.isClosing
+      ) {
+        closedDetailsSummarySeen = true;
+        cursor = tag.end + 1;
+        if (shouldHideHtmlElement(tag)) {
+          hiddenElement = tag.name;
+          hiddenDepth = 1;
+          hiddenDescendantStack = createHtmlStack();
+        } else {
+          closedDetailsSummaryVisible = true;
+          output.push(' ');
+        }
+      } else if (
+        isHtmlElementTag(tag)
+        && !tag.isClosing
+        && !HTML_VOID_ELEMENTS.has(tag.name)
+      ) {
+        recoverRepeatedButtonStart(closedDetailsHiddenStack, tag);
+        pushHtmlStack(closedDetailsHiddenStack, tag.name);
+      } else if (isHtmlElementTag(tag) && tag.isClosing) {
+        const matchingIndex = htmlStackLastIndex(closedDetailsHiddenStack, tag.name);
+        if (matchingIndex !== -1) truncateHtmlStack(closedDetailsHiddenStack, matchingIndex);
+      }
+      continue;
+    }
+
+    output.push(input.slice(cursor, tag.start));
+    if (ignoredNestedFormStart) {
+      cursor = tag.end + 1;
+      continue;
+    }
+    if (shouldHideHtmlElement(tag)) {
+      hiddenElement = tag.name;
+      hiddenDepth = 1;
+      hiddenDescendantStack = createHtmlStack();
+      cursor = tag.end + 1;
+      continue;
+    }
+    if (tag.name === 'details' && !tag.isClosing && !hasHtmlAttribute(tag.openingTag, 'open')) {
+      closedDetailsDepth = 1;
+      closedDetailsSummarySeen = false;
+      closedDetailsSummaryVisible = false;
+      closedDetailsHiddenStack = createHtmlStack();
+      cursor = tag.end + 1;
+      output.push(' ');
+      continue;
+    }
+    if (!tag.isComment) {
+      output.push(tag.name === 'br' || (tag.name === 'p' && tag.isClosing) ? '\n' : ' ');
+    }
+    cursor = tag.end + 1;
+  }
+  if (
+    !hiddenElement
+    && (closedDetailsDepth === 0 || closedDetailsSummaryVisible)
+  ) {
+    output.push(input.slice(cursor));
+  }
+  return output.join('');
+}
+
+function decodeNumericEntity(value, radix) {
+  const codePoint = Number.parseInt(value, radix);
+  const isScalarValue = Number.isInteger(codePoint)
+    && codePoint >= 0
+    && codePoint <= 0x10_FFFF
+    && (codePoint < 0xD800 || codePoint > 0xDFFF);
+  return isScalarValue ? String.fromCodePoint(codePoint) : '\uFFFD';
+}
+
+function isPlausibleMalformedTagToken(value) {
+  return /^(?:\/?[a-z]|[!?])/i.test(String(value).trimStart());
+}
+
+function* scanHtmlTags(value) {
+  const source = String(value);
+  let tagStart = -1;
+  let quote = null;
+  let rawTextElement = null;
+  let scriptEscaped = false;
+  let scriptDoubleEscaped = false;
+
+  for (let tagEnd = 0; tagEnd < source.length; tagEnd += 1) {
+    const character = source[tagEnd];
+    if (rawTextElement) {
+      if (rawTextElement === 'script') {
+        if (!scriptDoubleEscaped && source.startsWith('<!--', tagEnd)) {
+          scriptEscaped = true;
+          tagEnd += 3;
+          continue;
+        }
+        if (scriptEscaped && !scriptDoubleEscaped && source.startsWith('-->', tagEnd)) {
+          scriptEscaped = false;
+          tagEnd += 2;
+          continue;
+        }
+        if (scriptEscaped && !scriptDoubleEscaped && character === '<') {
+          const nestedNameEnd = tagEnd + 1 + rawTextElement.length;
+          if (
+            source.slice(tagEnd + 1, nestedNameEnd).toLowerCase() === rawTextElement
+            && /[\s/>]/.test(source[nestedNameEnd] ?? '')
+          ) {
+            scriptDoubleEscaped = true;
+            continue;
+          }
+        }
+      }
+      if (character !== '<' || source[tagEnd + 1] !== '/') continue;
+      const nameStart = tagEnd + 2;
+      const nameEnd = nameStart + rawTextElement.length;
+      if (source.slice(nameStart, nameEnd).toLowerCase() !== rawTextElement) continue;
+      if (!/[\s/>]/.test(source[nameEnd] ?? '')) continue;
+      if (rawTextElement === 'script' && scriptDoubleEscaped) {
+        scriptDoubleEscaped = false;
+        continue;
+      }
+      let closingEnd = nameEnd;
+      let closingQuote = null;
+      for (; closingEnd < source.length; closingEnd += 1) {
+        const closingCharacter = source[closingEnd];
+        if (closingQuote) {
+          if (closingCharacter === closingQuote) closingQuote = null;
+        } else if (closingCharacter === '"' || closingCharacter === "'") {
+          closingQuote = closingCharacter;
+        } else if (closingCharacter === '>') {
+          break;
+        }
+      }
+      if (closingEnd >= source.length) return;
+      yield {
+        name: rawTextElement,
+        isClosing: true,
+        isSelfClosing: false,
+        isComment: false,
+        isMalformed: false,
+        start: tagEnd,
+        end: closingEnd,
+        openingTag: source.slice(tagEnd, closingEnd + 1),
+      };
+      rawTextElement = null;
+      scriptEscaped = false;
+      tagEnd = closingEnd;
+      continue;
+    }
+    if (tagStart === -1) {
+      if (character !== '<') continue;
+      if (source.startsWith('<!--', tagEnd)) {
+        const commentEnd = source.indexOf('-->', tagEnd + 4);
+        if (commentEnd === -1) break;
+        yield {
+          name: '!--',
+          isClosing: false,
+          isSelfClosing: true,
+          isComment: true,
+          isMalformed: false,
+          start: tagEnd,
+          end: commentEnd + 2,
+          openingTag: source.slice(tagEnd, commentEnd + 3),
+        };
+        tagEnd = commentEnd + 2;
+        continue;
+      }
+      tagStart = tagEnd;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === '<') {
+      const abandoned = source.slice(tagStart + 1, tagEnd);
+      if (isPlausibleMalformedTagToken(abandoned)) {
+        yield {
+          name: '',
+          isClosing: false,
+          isSelfClosing: true,
+          isComment: false,
+          isMalformed: true,
+          start: tagStart,
+          end: tagEnd - 1,
+          openingTag: source.slice(tagStart, tagEnd),
+        };
+      }
+      tagStart = tagEnd;
+      continue;
+    }
+    if (character !== '>') continue;
+
+    const token = source.slice(tagStart + 1, tagEnd).trim();
+    const isClosing = token.startsWith('/');
+    const nameStart = isClosing ? 1 : 0;
+    let nameEnd = nameStart;
+    while (nameEnd < token.length && !/[\s/]/.test(token[nameEnd])) nameEnd += 1;
+    const name = token.slice(nameStart, nameEnd).toLowerCase();
+    if (name) {
+      yield {
+        name,
+        isClosing,
+        isSelfClosing: !isClosing && token.endsWith('/'),
+        isComment: false,
+        isMalformed: false,
+        start: tagStart,
+        end: tagEnd,
+        openingTag: source.slice(tagStart, tagEnd + 1),
+      };
+      if (!isClosing && HTML_RAW_TEXT_ELEMENTS.has(name)) {
+        rawTextElement = name;
+        scriptEscaped = false;
+        scriptDoubleEscaped = false;
+      }
+    }
+    tagStart = -1;
+  }
+
+  if (tagStart !== -1) {
+    const unfinished = source.slice(tagStart + 1);
+    if (isPlausibleMalformedTagToken(unfinished)) {
+      yield {
+        name: '',
+        isClosing: false,
+        isSelfClosing: true,
+        isComment: false,
+        isMalformed: true,
+        start: tagStart,
+        end: source.length - 1,
+        openingTag: source.slice(tagStart),
+      };
+    }
+  }
+}
+
+function scanHtmlAnchors(value) {
+  const source = String(value);
+  const anchors = [];
+  let current = null;
+  let templateDepth = 0;
+  for (const tag of scanHtmlTags(source)) {
+    const insideTemplate = templateDepth > 0;
+    if (isHtmlElementTag(tag) && tag.name === 'template') {
+      templateDepth = tag.isClosing
+        ? Math.max(0, templateDepth - 1)
+        : templateDepth + 1;
+      continue;
+    }
+    if (insideTemplate) continue;
+    if (tag.name !== 'a') continue;
+    if (tag.isClosing) {
+      if (current) {
+        anchors.push({
+          openingTag: current.openingTag,
+          body: source.slice(current.bodyStart, tag.start),
+        });
+        current = null;
+      }
+    } else if (!tag.isSelfClosing) {
+      // Starting a new anchor also abandons an unterminated prior one, matching
+      // browser recovery while keeping malformed repeated tags linear.
+      current = {
+        openingTag: tag.openingTag,
+        bodyStart: tag.end + 1,
+      };
+    }
+  }
+  return anchors;
+}
+
+function hasHtmlAttribute(openingTag, attribute) {
+  const target = attribute.toLowerCase();
+  let cursor = 1;
+  while (cursor < openingTag.length && !/[\s/>]/.test(openingTag[cursor])) cursor += 1;
+
+  while (cursor < openingTag.length) {
+    while (cursor < openingTag.length && /[\s/]/.test(openingTag[cursor])) cursor += 1;
+    if (cursor >= openingTag.length || openingTag[cursor] === '>') break;
+
+    const nameStart = cursor;
+    while (cursor < openingTag.length && !/[\s=/>]/.test(openingTag[cursor])) cursor += 1;
+    const name = openingTag.slice(nameStart, cursor).toLowerCase();
+    if (name === target) return true;
+    while (cursor < openingTag.length && /\s/.test(openingTag[cursor])) cursor += 1;
+    if (openingTag[cursor] !== '=') continue;
+
+    cursor += 1;
+    while (cursor < openingTag.length && /\s/.test(openingTag[cursor])) cursor += 1;
+    const quote = openingTag[cursor];
+    if (quote === '"' || quote === "'") {
+      const valueEnd = openingTag.indexOf(quote, cursor + 1);
+      if (valueEnd === -1) return false;
+      cursor = valueEnd + 1;
+    } else {
+      while (cursor < openingTag.length && !/[\s>]/.test(openingTag[cursor])) cursor += 1;
+    }
+  }
+
+  return false;
+}
+
+function quotedHtmlAttribute(openingTag, attribute) {
+  const target = attribute.toLowerCase();
+  let cursor = 1;
+  while (cursor < openingTag.length && !/[\s/>]/.test(openingTag[cursor])) cursor += 1;
+
+  while (cursor < openingTag.length) {
+    while (cursor < openingTag.length && /[\s/]/.test(openingTag[cursor])) cursor += 1;
+    if (cursor >= openingTag.length || openingTag[cursor] === '>') break;
+
+    const nameStart = cursor;
+    while (cursor < openingTag.length && !/[\s=/>]/.test(openingTag[cursor])) cursor += 1;
+    const name = openingTag.slice(nameStart, cursor).toLowerCase();
+    const isTarget = name === target;
+    while (cursor < openingTag.length && /\s/.test(openingTag[cursor])) cursor += 1;
+    if (openingTag[cursor] !== '=') {
+      if (isTarget) return null;
+      continue;
+    }
+
+    cursor += 1;
+    while (cursor < openingTag.length && /\s/.test(openingTag[cursor])) cursor += 1;
+    const quote = openingTag[cursor];
+    if (quote !== '"' && quote !== "'") {
+      while (cursor < openingTag.length && !/[\s>]/.test(openingTag[cursor])) cursor += 1;
+      if (isTarget) return null;
+      continue;
+    }
+
+    const valueStart = cursor + 1;
+    const valueEnd = openingTag.indexOf(quote, valueStart);
+    if (valueEnd === -1) return null;
+    if (isTarget) return openingTag.slice(valueStart, valueEnd);
+    cursor = valueEnd + 1;
+  }
+
+  return null;
+}
+
+function htmlClassNames(openingTag) {
+  return new Set(
+    (quotedHtmlAttribute(openingTag, 'class') || '')
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(className => className.toLowerCase()),
+  );
+}
+
+function extractHtmlElementBodies(value, tagNames, className, maxMatches = 1) {
+  const source = String(value);
+  const allowedTags = new Set(tagNames);
+  const bodies = [];
+  let current = null;
+  let depth = 0;
+  let templateDepth = 0;
+
+  for (const tag of scanHtmlTags(source)) {
+    const insideTemplate = templateDepth > 0;
+    if (isHtmlElementTag(tag) && tag.name === 'template') {
+      templateDepth = tag.isClosing
+        ? Math.max(0, templateDepth - 1)
+        : templateDepth + 1;
+      continue;
+    }
+    if (insideTemplate) continue;
+    if (current) {
+      if (tag.name !== current.name) continue;
+      if (tag.isClosing) depth -= 1;
+      else if (!tag.isSelfClosing) depth += 1;
+      if (depth === 0) {
+        bodies.push(source.slice(current.end + 1, tag.start));
+        if (bodies.length >= maxMatches) return bodies;
+        current = null;
+      }
+      continue;
+    }
+    if (
+      !tag.isClosing
+      && !tag.isSelfClosing
+      && allowedTags.has(tag.name)
+      && htmlClassNames(tag.openingTag).has(className)
+    ) {
+      current = tag;
+      depth = 1;
+    }
+  }
+
+  return bodies;
+}
+
 function decodeHtml(value) {
-  return String(value)
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, digits) => String.fromCodePoint(Number.parseInt(digits, 10)))
+  return stripHtmlTags(value)
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => decodeNumericEntity(hex, 16))
+    .replace(/&#(\d+);/g, (_, digits) => decodeNumericEntity(digits, 10))
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&quot;/gi, '"')
@@ -305,7 +1140,7 @@ function decodeHtml(value) {
 }
 
 function dottedDate(value) {
-  const match = String(value).match(/(\d{4})\.(\d{2})\.(\d{2})/);
+  const match = String(value).trim().match(/^(\d{4})\.(\d{2})\.(\d{2})$/);
   if (!match) return null;
   const day = `${match[1]}-${match[2]}-${match[3]}`;
   const parsed = new Date(`${day}T00:00:00.000Z`);
@@ -316,13 +1151,15 @@ function dottedDate(value) {
 
 export function parseTaiwanMndList(html) {
   const rows = [];
-  const pattern = /<a[^>]+href=["']([^"']*\/News\/PLAAct\/\d+)["'][^>]*>[\s\S]*?<h5[^>]*class=["'][^"']*\bdate\b[^"']*["'][^>]*>([^<]+)<\/h5>/gi;
-  for (const match of String(html).matchAll(pattern)) {
-    const publicationDay = dottedDate(match[2]);
+  for (const anchor of scanHtmlAnchors(html)) {
+    const href = quotedHtmlAttribute(anchor.openingTag, 'href');
+    if (!href || !/\/News\/PLAAct\/\d+$/i.test(href)) continue;
+    const dateBody = extractHtmlElementBodies(anchor.body, ['h5'], 'date')[0];
+    const publicationDay = dateBody?.includes('<') ? null : dottedDate(dateBody);
     if (!publicationDay) continue;
     let sourceUrl;
     try {
-      sourceUrl = new URL(match[1], 'https://www.mnd.gov.tw').href;
+      sourceUrl = new URL(href, 'https://www.mnd.gov.tw').href;
     } catch {
       continue;
     }
@@ -415,32 +1252,18 @@ function mndCounts(text) {
 }
 
 function extractMndReportBody(html) {
-  const source = String(html);
-  const start = /<(div|article|section)\b[^>]*\bclass=["'][^"']*\bmaincontent\b[^"']*["'][^>]*>/i.exec(source);
-  if (!start || start.index == null) throw new Error('MND_REPORT_BODY_MISSING');
-  const tagName = start[1];
-  const tagPattern = new RegExp(`<\\/?${tagName}\\b[^>]*>`, 'gi');
-  tagPattern.lastIndex = start.index + start[0].length;
-  let depth = 1;
-  let match;
-  while ((match = tagPattern.exec(source))) {
-    if (/^<\//.test(match[0])) depth -= 1;
-    else if (!/\/\s*>$/.test(match[0])) depth += 1;
-    if (depth === 0) return source.slice(start.index + start[0].length, match.index);
-  }
-  throw new Error('MND_REPORT_BODY_MISSING');
+  const body = extractHtmlElementBodies(html, ['div', 'article', 'section'], 'maincontent')[0];
+  if (body == null) throw new Error('MND_REPORT_BODY_MISSING');
+  return body;
 }
 
 function extractMndPublicationDay(html) {
-  const source = String(html);
-  const container = /<(div|section)\b[^>]*\bclass=["'][^"']*\b(?:pageinfo|newsInfo)\b[^"']*["'][^>]*>([\s\S]*?)<\/\1>/i
-    .exec(source);
-  if (!container) throw new Error('MND_PUBLICATION_METADATA_MISSING');
-  const matches = [...container[2].matchAll(
-    /<span[^>]*class=["'][^"']*\bbody-2\b[^"']*["'][^>]*>\s*(\d{4}\.\d{2}\.\d{2})\s*<\/span>/gi,
-  )];
-  const publicationDay = dottedDate(matches[0]?.[1]);
-  if (!publicationDay || matches.length !== 1) throw new Error('MND_PUBLICATION_DATE_MISSING');
+  const container = extractHtmlElementBodies(html, ['div', 'section'], 'pageinfo')[0]
+    ?? extractHtmlElementBodies(html, ['div', 'section'], 'newsinfo')[0];
+  if (container == null) throw new Error('MND_PUBLICATION_METADATA_MISSING');
+  const dateBodies = extractHtmlElementBodies(container, ['span'], 'body-2', 2);
+  const publicationDay = dateBodies[0]?.includes('<') ? null : dottedDate(dateBodies[0]);
+  if (!publicationDay || dateBodies.length !== 1) throw new Error('MND_PUBLICATION_DATE_MISSING');
   return publicationDay;
 }
 
@@ -562,13 +1385,19 @@ export function parseTaiwanMndDetail(
 
 export function parseJapanModIndex(html) {
   const rows = [];
-  const pattern = /<a[^>]+href=["']([^"']+\.pdf)["'][^>]*>([\s\S]*?)<\/a>/gi;
-  for (const match of String(html).matchAll(pattern)) {
-    const sourceUrl = new URL(match[1], JMOD_INDEX_URL).href;
+  for (const anchor of scanHtmlAnchors(html)) {
+    const href = quotedHtmlAttribute(anchor.openingTag, 'href');
+    if (!href || !/\.pdf$/i.test(href)) continue;
+    let sourceUrl;
+    try {
+      sourceUrl = new URL(href, JMOD_INDEX_URL).href;
+    } catch {
+      continue;
+    }
     if (!isAllowedSourceUrl(sourceUrl, CROSS_STRAIT_SOURCE_CONTRACTS.japanMod)) continue;
     rows.push({
       sourceUrl,
-      title: decodeHtml(match[2]),
+      title: decodeHtml(anchor.body),
     });
   }
   return [...new Map(rows.map((row) => [row.sourceUrl, row])).values()];
@@ -599,11 +1428,8 @@ export async function readBoundedTextResponse(response, maxBytes) {
   return Buffer.concat(chunks, total).toString('utf8');
 }
 
-async function fetchBoundedText(fetchFn, url, sourceContract) {
-  if (!isAllowedSourceUrl(url, sourceContract)) {
-    throw new Error('UNSAFE_SOURCE_URL');
-  }
-  const response = await fetchFn(url, {
+function boundedHtmlRequestInit(sourceContract) {
+  return {
     headers: {
       Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1',
       'Accept-Language': 'en',
@@ -611,8 +1437,83 @@ async function fetchBoundedText(fetchFn, url, sourceContract) {
     },
     redirect: sourceContract.redirectPolicy,
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
+  };
+}
+
+async function fetchBoundedText(fetchFn, url, sourceContract) {
+  if (!isAllowedSourceUrl(url, sourceContract)) {
+    throw new Error('UNSAFE_SOURCE_URL');
+  }
+  const response = await fetchFn(url, boundedHtmlRequestInit(sourceContract));
   return readBoundedTextResponse(response, sourceContract.maxResponseBytes);
+}
+
+function shouldProxyJapanModFailure(error) {
+  const code = errorCode(error);
+  if (code === 'SOURCE_ERROR' || code === 'TIMEOUT') return true;
+  const status = Number(/^HTTP_(\d{3})$/u.exec(code)?.[1]);
+  return status === 403
+    || status === 408
+    || status === 425
+    || status === 429
+    || status >= 500;
+}
+
+async function fetchJapanModViaConfiguredProxy(input, init, {
+  proxyUrl,
+  proxyRequestFn,
+}) {
+  const maxResponseBytes = CROSS_STRAIT_SOURCE_CONTRACTS.japanMod.maxResponseBytes;
+  const proxyConfig = parseProxyConfig(proxyUrl);
+  if (!proxyConfig) throw new Error('PROXY_CONFIG_INVALID');
+  const result = await proxyRequestFn(String(input), proxyConfig, {
+    // init.headers (from boundedHtmlRequestInit) always carries an Accept
+    // header, which proxyFetch's header spread applies after its own
+    // `accept` default — so headers.Accept is the actual source of truth.
+    headers: init?.headers,
+    method: init?.method ?? 'GET',
+    maxResponseBytes,
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    signal: init?.signal,
+  });
+  const status = Number(result.status);
+  if (!Number.isInteger(status) || status < 200 || status >= 300) {
+    throw Object.assign(
+      new Error(`HTTP_${Number.isInteger(status) ? status : 'UNKNOWN'}`),
+      {
+        status: Number.isInteger(status) ? status : null,
+        contentType: result?.contentType,
+        bodyPrefix: proxyBodyPrefix(result?.buffer),
+        proxyStage: 'response',
+      },
+    );
+  }
+  if (!Buffer.isBuffer(result?.buffer)) {
+    throw Object.assign(new Error('PROXY_RESPONSE_INVALID'), {
+      status,
+      contentType: result?.contentType,
+      proxyStage: 'response',
+    });
+  }
+  if (result.buffer.byteLength > maxResponseBytes) {
+    throw Object.assign(new Error('RESPONSE_TOO_LARGE'), {
+      status,
+      contentType: result.contentType,
+      bodyPrefix: proxyBodyPrefix(result.buffer),
+      proxyStage: 'response',
+    });
+  }
+  return {
+    html: result.buffer.toString('utf8'),
+    detail: buildProxyDiagnosticDetail({
+      stage: 'response',
+      httpStatus: status,
+      contentType: result.contentType,
+      bodyPrefix: proxyBodyPrefix(result.buffer),
+      errorCode: null,
+      errorMessage: null,
+    }),
+  };
 }
 
 function withoutNestedHistory(observation) {
@@ -860,15 +1761,32 @@ export function buildCrossStraitActivitySnapshot({
         .slice(-MND_MAX_REVISION_VINTAGES_PER_DAY),
     }));
 
+  const previousJapanById = new Map(
+    (previousSnapshot?.observations ?? [])
+      .filter((row) => row?.sourceId === 'japan-mod')
+      .map((row) => [row.id, row]),
+  );
+  const hasCurrentJapanIndex = japanOutcome?.ok === true;
   const availableJapanUrls = new Set(japanOutcome?.availableDocumentUrls ?? []);
   const japan = REVIEWED_JAPAN_MOD_OBSERVATIONS.map((row) => ({
     ...structuredClone(row),
-    indexPresence: availableJapanUrls.has(row.sourceUrl) ? 'present' : 'not_observed_in_current_index',
+    indexPresence: hasCurrentJapanIndex
+      ? (availableJapanUrls.has(row.sourceUrl) ? 'present' : 'not_observed_in_current_index')
+      : (previousJapanById.get(row.id)?.indexPresence ?? 'unknown'),
   }));
   const observations = [...mnd, ...japan];
   const usableMndReportingDays = new Set(mnd.map((row) => row.reportingDay)).size;
   const mndContract = CROSS_STRAIT_SOURCE_CONTRACTS.taiwanMnd;
   const japanContract = CROSS_STRAIT_SOURCE_CONTRACTS.japanMod;
+  const previousJapanSource = previousSnapshot?.sources
+    ?.find((source) => source?.id === japanContract.id);
+  const unreviewedCandidateCount = hasCurrentJapanIndex
+    ? Math.max(
+        0,
+        (japanOutcome?.availableDocumentUrls?.length ?? 0)
+          - REVIEWED_JAPAN_MOD_OBSERVATIONS.filter((row) => availableJapanUrls.has(row.sourceUrl)).length,
+      )
+    : previousJapanSource?.unreviewedCandidateCount;
   const sources = [
     {
       id: mndContract.id,
@@ -889,19 +1807,32 @@ export function buildCrossStraitActivitySnapshot({
       claimSemantics: 'reviewed_regional_augmentation',
       transportStatus: japanOutcome?.ok ? 'fresh' : 'error',
       requestCount: japanOutcome?.requestCount ?? 0,
+      transportPath: japanOutcome?.transportPath ?? 'direct',
+      ...(japanOutcome?.blockedReason
+        ? { blockedReason: japanOutcome.blockedReason }
+        : {}),
+      ...(japanOutcome?.fallbackReason
+        ? { fallbackReason: japanOutcome.fallbackReason }
+        : {}),
+      ...(japanOutcome?.proxyFailureReason
+        ? { proxyFailureReason: japanOutcome.proxyFailureReason }
+        : {}),
+      ...(japanOutcome?.proxyFailureDetail
+        ? { proxyFailureDetail: japanOutcome.proxyFailureDetail }
+        : {}),
       errorCodes: japanOutcome?.errorCodes ?? [],
       lastSuccessAt: japanOutcome?.ok
         ? generatedAt
         : latestSourceSuccess(previousSnapshot, 'japan-mod'),
       admittedDocumentCount: REVIEWED_JAPAN_MOD_OBSERVATIONS.length,
-      unreviewedCandidateCount: Math.max(
-        0,
-        (japanOutcome?.availableDocumentUrls?.length ?? 0)
-          - REVIEWED_JAPAN_MOD_OBSERVATIONS.filter((row) => availableJapanUrls.has(row.sourceUrl)).length,
-      ),
+      ...(Number.isInteger(unreviewedCandidateCount)
+        ? { unreviewedCandidateCount }
+        : {}),
     },
   ];
-  const anyError = sources.some((source) => source.transportStatus === 'error');
+  const anyError = sources.some(
+    (source) => source.transportStatus === 'error' && !source.blockedReason,
+  );
   return constrainCrossStraitActivitySnapshotSize({
     schemaVersion: 1,
     generatedAt,
@@ -928,6 +1859,80 @@ function errorCode(error) {
   if (/MND_/.test(value)) return value.match(/MND_[A-Z0-9_]+/)?.[0] ?? 'MND_PARSE_ERROR';
   if (/JMOD_/.test(value)) return value.match(/JMOD_[A-Z0-9_]+/)?.[0] ?? 'JMOD_PARSE_ERROR';
   return 'SOURCE_ERROR';
+}
+
+function boundedDiagnosticString(value, maxChars = PROXY_DIAGNOSTIC_MAX_CHARS) {
+  if (typeof value !== 'string') return null;
+  const normalized = value
+    .replace(/(https?:\/\/)[^@\s/]+@/giu, '$1[redacted]@')
+    .replace(/(Proxy-Authorization:\s*)[^\r\n]+/giu, '$1[redacted]')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  return normalized ? normalized.slice(0, maxChars) : null;
+}
+
+function proxyBodyPrefix(value) {
+  if (!Buffer.isBuffer(value)) return null;
+  return boundedDiagnosticString(
+    value.toString('utf8', 0, 1_024),
+  );
+}
+
+function buildProxyDiagnosticDetail({
+  stage,
+  httpStatus = null,
+  contentType = null,
+  bodyPrefix = null,
+  errorCode: detailErrorCode = null,
+  errorMessage = null,
+}) {
+  const status = Number(httpStatus);
+  return {
+    stage,
+    httpStatus: Number.isInteger(status) && status >= 100 && status <= 599
+      ? status
+      : null,
+    contentType: boundedDiagnosticString(contentType, 128),
+    bodyPrefix: boundedDiagnosticString(bodyPrefix),
+    errorCode: boundedDiagnosticString(detailErrorCode, 64),
+    errorMessage: boundedDiagnosticString(errorMessage),
+  };
+}
+
+function proxyFailureDetail(error) {
+  const message = String(error?.message ?? '');
+  return buildProxyDiagnosticDetail({
+    stage: error?.proxyStage === 'response'
+      ? 'response'
+      : (/Proxy CONNECT:/i.test(message) ? 'connect' : 'request'),
+    httpStatus: error?.status,
+    contentType: error?.contentType,
+    bodyPrefix: error?.bodyPrefix,
+    errorCode: error?.code,
+    errorMessage: message,
+  });
+}
+
+function proxyErrorCode(error) {
+  const code = errorCode(error);
+  if (Number(error?.status) === 407
+    || code === 'HTTP_407'
+    || /Proxy CONNECT:[^\n]*\b407\b/i.test(String(error?.message ?? ''))) {
+    return 'PROXY_AUTH_FAILED';
+  }
+  if (Number(error?.status) === 403
+    && /Proxy CONNECT:[^\n]*\b403\b/i.test(String(error?.message ?? ''))) {
+    return 'PROXY_CONNECT_FORBIDDEN';
+  }
+  return String(error?.message ?? '').match(/PROXY_[A-Z0-9_]+/)?.[0] ?? code;
+}
+
+function blockedJapanProxyReason(directFailureCode, proxyFailureCode) {
+  if (directFailureCode !== 'HTTP_403') return null;
+  // A CONNECT refusal is emitted by the proxy before the TLS tunnel reaches
+  // Japan MOD. Only a 403 response received after CONNECT proves that both
+  // source-facing transport paths are externally blocked.
+  return proxyFailureCode === 'HTTP_403' ? proxyFailureCode : null;
 }
 
 function rotatingRefreshCandidates(previousMnd, excludedUrls, now) {
@@ -958,25 +1963,88 @@ function hasMndOutboundBudget({ runStartedAt, nowFn, cadenceMs }) {
   return nowFn() - runStartedAt + cadenceMs + REQUEST_TIMEOUT_MS <= MND_OUTBOUND_BUDGET_MS;
 }
 
-async function fetchJapanIndexOutcome(fetchFn, sleepFn) {
+async function fetchJapanIndexOutcome(fetchFn, sleepFn, {
+  proxyFetchFn = null,
+} = {}) {
+  const contract = CROSS_STRAIT_SOURCE_CONTRACTS.japanMod;
+  let html;
+  let requestCount = 1;
+  let transportPath = 'direct';
+  let fallbackReason = null;
+  let proxyResponseDetail = null;
   try {
     await sleepFn(REQUEST_CADENCE_MS);
-    const contract = CROSS_STRAIT_SOURCE_CONTRACTS.japanMod;
-    const html = await fetchBoundedText(fetchFn, contract.indexUrl, contract);
+    html = await fetchBoundedText(fetchFn, contract.indexUrl, contract);
+  } catch (directError) {
+    if (!proxyFetchFn || !shouldProxyJapanModFailure(directError)) {
+      return {
+        ok: false,
+        requestCount,
+        transportPath,
+        availableDocumentUrls: [],
+        errorCodes: [errorCode(directError)],
+      };
+    }
+    fallbackReason = errorCode(directError);
+    requestCount += 1;
+    transportPath = 'proxy';
+    try {
+      await sleepFn(REQUEST_CADENCE_MS);
+      const proxyResult = await proxyFetchFn(contract.indexUrl, boundedHtmlRequestInit(contract));
+      html = proxyResult.html;
+      proxyResponseDetail = proxyResult.detail;
+    } catch (proxyError) {
+      const failureCode = proxyErrorCode(proxyError);
+      const blockedReason = blockedJapanProxyReason(fallbackReason, failureCode);
+      return {
+        ok: false,
+        ...(blockedReason ? { blockedReason } : {}),
+        requestCount,
+        transportPath,
+        fallbackReason,
+        proxyFailureReason: failureCode,
+        proxyFailureDetail: proxyFailureDetail(proxyError),
+        availableDocumentUrls: [],
+        errorCodes: [...new Set([fallbackReason, failureCode])],
+      };
+    }
+  }
+
+  try {
     const rows = parseJapanModIndex(html);
     if (rows.length === 0) throw new Error('JMOD_INDEX_EMPTY');
     return {
       ok: true,
-      requestCount: 1,
+      requestCount,
+      transportPath,
+      ...(fallbackReason ? { fallbackReason } : {}),
       availableDocumentUrls: rows.map((row) => row.sourceUrl),
       errorCodes: [],
     };
   } catch (error) {
+    const failureCode = errorCode(error);
     return {
       ok: false,
-      requestCount: 1,
+      requestCount,
+      transportPath,
+      ...(fallbackReason ? { fallbackReason } : {}),
+      ...(transportPath === 'proxy'
+        ? { proxyFailureReason: failureCode }
+        : {}),
+      ...(transportPath === 'proxy'
+        ? {
+            proxyFailureDetail: buildProxyDiagnosticDetail({
+              ...proxyResponseDetail,
+              stage: 'parse',
+              errorCode: failureCode,
+              errorMessage: error?.message,
+            }),
+          }
+        : {}),
       availableDocumentUrls: [],
-      errorCodes: [errorCode(error)],
+      errorCodes: fallbackReason
+        ? [...new Set([fallbackReason, failureCode])]
+        : [failureCode],
     };
   }
 }
@@ -988,6 +2056,8 @@ export async function fetchCrossStraitActivitySnapshot({
   previousSnapshot = null,
   mndListUrl = CROSS_STRAIT_SOURCE_CONTRACTS.taiwanMnd.listUrl,
   sleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  proxyUrl = process.env.PROXY_URL ?? '',
+  proxyRequestFn = proxyFetch,
 } = {}) {
   const generatedAt = new Date(now).toISOString();
   const previousMnd = (previousSnapshot?.observations ?? [])
@@ -1001,7 +2071,15 @@ export async function fetchCrossStraitActivitySnapshot({
   const unseenBackfillCandidates = new Map();
   const mndErrors = [];
   const mndContract = CROSS_STRAIT_SOURCE_CONTRACTS.taiwanMnd;
-  const japanOutcomePromise = fetchJapanIndexOutcome(fetchFn, sleepFn);
+  const resolvedJapanProxyFetchFn = proxyUrl
+    ? (input, init) => fetchJapanModViaConfiguredProxy(input, init, {
+        proxyUrl,
+        proxyRequestFn,
+      })
+    : null;
+  const japanOutcomePromise = fetchJapanIndexOutcome(fetchFn, sleepFn, {
+    proxyFetchFn: resolvedJapanProxyFetchFn,
+  });
   let discoveredCount = 0;
   let requestCount = 0;
   const runStartedAt = nowFn();

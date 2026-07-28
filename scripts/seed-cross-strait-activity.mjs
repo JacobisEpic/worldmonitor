@@ -35,6 +35,11 @@ function withoutRevisionHistory(observation) {
   return currentRevision;
 }
 
+function withoutProxyFailureDetail(source) {
+  const { proxyFailureDetail: _proxyFailureDetail, ...publicSource } = source;
+  return publicSource;
+}
+
 /**
  * The durable record retains the bounded MND backfill and correction vintages.
  * Bootstrap only needs the current MND row plus reviewed Japan context; keeping
@@ -51,7 +56,7 @@ export function projectCrossStraitActivityBootstrap(snapshot) {
     schemaVersion: snapshot?.schemaVersion,
     generatedAt: snapshot?.generatedAt,
     status: snapshot?.status,
-    sources: snapshot?.sources ?? [],
+    sources: (snapshot?.sources ?? []).map(withoutProxyFailureDetail),
     coverage: snapshot?.coverage ?? {},
     observations: [...mnd, ...reviewedJapan].map(withoutRevisionHistory),
     baselines: snapshot?.baselines ?? {},
@@ -78,17 +83,44 @@ function sourceRecordCount(snapshot, sourceId) {
 }
 
 export async function writeSourceHealth(snapshot, writer = writeExtraKey) {
-  await Promise.all((snapshot?.sources ?? []).map(async (source) => {
+  const outcomes = await Promise.allSettled((snapshot?.sources ?? []).map(async (source) => {
     const healthy = source?.transportStatus === 'fresh';
-    const fetchedAt = Date.parse(source?.lastSuccessAt ?? '');
-    await writer(sourceHealthKey(source.id), source, CROSS_STRAIT_ACTIVITY_TTL_SECONDS);
-    await writer(sourceHealthMetaKey(source.id), {
+    const blocked = source?.blockedReason === 'HTTP_403';
+    const fetchedAt = Date.parse(
+      blocked ? snapshot?.generatedAt ?? '' : source?.lastSuccessAt ?? '',
+    );
+    const writeData = () => writer(
+      sourceHealthKey(source.id),
+      source,
+      CROSS_STRAIT_ACTIVITY_TTL_SECONDS,
+    );
+    const writeMeta = () => writer(sourceHealthMetaKey(source.id), {
       fetchedAt: Number.isFinite(fetchedAt) ? fetchedAt : 0,
       recordCount: sourceRecordCount(snapshot, source.id),
-      sourceState: healthy ? 'ok' : 'error',
-      stale: !healthy,
+      sourceState: healthy ? 'ok' : (blocked ? 'blocked' : 'error'),
+      stale: !healthy && !blocked,
     }, CROSS_STRAIT_ACTIVITY_TTL_SECONDS);
+
+    // Never leave health claiming success when an error detail write fails.
+    // Healthy observations may publish data first because an older `ok` meta
+    // remains truthful; degraded observations publish the error meta first.
+    if (healthy || blocked) {
+      await writeData();
+      await writeMeta();
+    } else {
+      await writeMeta();
+      await writeData();
+    }
   }));
+  const failures = outcomes
+    .filter((outcome) => outcome.status === 'rejected')
+    .map((outcome) => outcome.reason);
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      `cross-Strait source-health write failed: ${failures.map((error) => error?.message ?? error).join('; ')}`,
+    );
+  }
 }
 
 export async function writePublicationCompletion(
@@ -96,7 +128,6 @@ export async function writePublicationCompletion(
   writer = writeExtraKey,
   completedAt = Date.now(),
 ) {
-  await writeSourceHealth(snapshot, writer);
   await writer(CROSS_STRAIT_ACTIVITY_COMPLETION_META_KEY, {
     fetchedAt: completedAt,
     recordCount: snapshot.observations.length,
@@ -105,7 +136,7 @@ export async function writePublicationCompletion(
 }
 
 /**
- * runSeed invokes the hook as `afterPublish(data, { canonicalKey, ttlSeconds,
+ * runSeed invokes the hook as `afterFreshness(data, { canonicalKey, ttlSeconds,
  * recordCount, runId })`. `writePublicationCompletion` takes its injectable
  * writer in that same positional slot, and a `= writeExtraKey` default only
  * applies to `undefined` — so wiring it in bare put the meta object in `writer`
@@ -115,6 +146,10 @@ export async function writePublicationCompletion(
 export function crossStraitActivityAfterPublish(snapshot, _runSeedMeta, writer = writeExtraKey) {
   return writePublicationCompletion(snapshot, writer);
 }
+
+// Source-health is a mandatory pre-publication cohort; completion uses the
+// meta-tolerant #5614 wrapper only after primary freshness metadata succeeds.
+export const crossStraitActivityBeforePublish = (snapshot) => writeSourceHealth(snapshot);
 
 export function crossStraitActivityContentMeta(snapshot) {
   return tokensToContentMeta((snapshot?.observations ?? [])
@@ -138,8 +173,9 @@ function validatePublishableSnapshot(snapshot) {
   if (!validateCrossStraitActivitySnapshot(snapshot)) return false;
   // runSeed commits the canonical key before extraKeys. Precomputing the
   // bounded projection here prevents a transform failure from creating a fresh
-  // canonical archive with no UI payload. The completion marker below makes a
-  // later source-health write failure retryable on the next bundle tick.
+  // canonical archive with no UI payload. Source health is written through
+  // runSeed's pre-publish hook; the completion marker remains the final cohort
+  // write so the bundle retries any partial publication on its next tick.
   projectCrossStraitActivityBootstrap(snapshot);
   return true;
 }
@@ -159,10 +195,11 @@ if (process.argv[1]?.endsWith('seed-cross-strait-activity.mjs')) {
     extraKeys: [{
       key: CROSS_STRAIT_ACTIVITY_BOOTSTRAP_KEY,
       transform: projectCrossStraitActivityBootstrap,
-      declareRecords: (snapshot) => projectCrossStraitActivityBootstrap(snapshot).observations.length,
+      declareRecords: (projection) => projection.observations.length,
       metaKey: CROSS_STRAIT_ACTIVITY_BOOTSTRAP_META_KEY,
       metaCritical: true,
     }],
-    afterPublish: crossStraitActivityAfterPublish,
+    beforePublish: crossStraitActivityBeforePublish,
+    afterFreshness: crossStraitActivityAfterPublish,
   });
 }

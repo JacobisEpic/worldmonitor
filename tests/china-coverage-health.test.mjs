@@ -302,6 +302,85 @@ describe('China coverage manifest', () => {
     assert.ok(missingTransport.entries[0].reasonCodes.includes(CHINA_COVERAGE_REASON_CODES.TRANSPORT_MISSING));
   });
 
+  it('reports a fresh but degraded disclosure snapshot as partial coverage', () => {
+    const disclosures = CHINA_COVERAGE_ENTRIES.find(
+      (entry) => entry.id === 'market.china-corporate-disclosures',
+    );
+    const result = evaluate(
+      disclosures,
+      {
+        'market:china:corporate-disclosures:v1': {
+          status: 'degraded',
+          coverageThrough: null,
+          events: [],
+          sources: [
+            { id: 'sse', transportStatus: 'fresh', contentStatus: 'partial' },
+            { id: 'szse', transportStatus: 'error', contentStatus: 'unavailable' },
+          ],
+        },
+      },
+      {
+        'seed-meta:market:china-corporate-disclosures': {
+          fetchedAt: NOW,
+          status: 'ok',
+        },
+      },
+    );
+
+    assert.equal(result.entries[0].status, 'degraded');
+    assert.equal(result.entries[0].content.status, 'partial');
+    assert.deepEqual(
+      result.entries[0].reasonCodes,
+      [CHINA_COVERAGE_REASON_CODES.CHINA_COVERAGE_PARTIAL],
+    );
+  });
+
+  it('keeps a healthy zero-event disclosure window healthy when fetched filings are outside the owned taxonomy', () => {
+    const disclosures = CHINA_COVERAGE_ENTRIES.find(
+      (entry) => entry.id === 'market.china-corporate-disclosures',
+    );
+    const result = evaluate(
+      disclosures,
+      {
+        'market:china:corporate-disclosures:v1': {
+          status: 'healthy',
+          coverageThrough: '2026-07-13',
+          events: [],
+          unclassifiedRevisions: [
+            {
+              titleOriginal: '董事会秘书工作细则',
+              revisionState: 'corrected',
+              publicationTime: { value: '2026-07-13' },
+            },
+            {
+              titleOriginal: '修订公司制度',
+              revisionState: 'corrected',
+              publicationTime: { value: '2026-07-13' },
+            },
+          ],
+          sources: [
+            { id: 'sse', transportStatus: 'fresh', contentStatus: 'current' },
+            { id: 'szse', transportStatus: 'fresh', contentStatus: 'current' },
+            { id: 'hkex', launchStatus: 'blocked' },
+          ],
+        },
+      },
+      {
+        'seed-meta:market:china-corporate-disclosures': {
+          fetchedAt: NOW,
+          recordCount: 0,
+          status: 'ok',
+        },
+      },
+    );
+
+    assert.equal(result.status, 'healthy');
+    assert.equal(result.counts.healthy, 1);
+    assert.equal(result.entries[0].status, 'healthy');
+    assert.equal(result.entries[0].content.status, 'fresh');
+    assert.deepEqual(result.entries[0].reasonCodes, []);
+  });
+
   it('uses the source-specific China news projection rather than global top stories', () => {
     const news = CHINA_COVERAGE_ENTRIES.find((entry) => entry.id === 'news.china');
     const data = {

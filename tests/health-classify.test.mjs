@@ -128,6 +128,24 @@ test('classifyKey: socialVelocity error seed-meta → SEED_ERROR while data is p
   assert.equal(entry.records, 1);
 });
 
+test('classifyKey: a permanently blocked humanitarian provider surfaces as SEED_ERROR', () => {
+  const dataKey = STANDALONE_KEYS.humanitarianSummary;
+  const metaKey = SEED_META.humanitarianSummary.key;
+  const entry = classifyKey('humanitarianSummary', dataKey, { allowOnDemand: false },
+    makeCtx({
+      strens: { [dataKey]: 1234 },
+      metaValues: {
+        [metaKey]: seedMeta({
+          status: 'error',
+          errorReason: 'HAPI_PROXY_FALLBACK_FAILED',
+        }),
+      },
+    }));
+
+  assert.equal(entry.status, 'SEED_ERROR');
+  assert.equal(STATUS_COUNTS[entry.status], 'warn');
+});
+
 test('classifyKey: socialVelocity/wsbTickers tolerate the 3h cadence — fresh at 300min → OK', () => {
   // Cadence dropped 1h→3h (ScrapeCreators), so maxStaleMin was raised 180→540.
   // A healthy seed-meta aged 300min (5h, inside 540) must NOT false-alarm.
@@ -197,7 +215,7 @@ const ISSUE_5055_HEALTH_REGISTRATIONS = [
   ['defensePatents', 'patents:defense:latest', 'seed-meta:military:defense-patents', 25200],
   ['acledIntel', 'conflict:acled:v1:all:0:0', 'seed-meta:conflict:acled-intel', 38],
   ['portwatchDisruptions', 'portwatch:disruptions:active:v1', 'seed-meta:portwatch:disruptions', 150],
-  ['comtradeBilateralHs4', 'seed-meta:comtrade:bilateral-hs4', 'seed-meta:comtrade:bilateral-hs4', 34560],
+  ['comtradeBilateralHs4', 'seed-meta:comtrade:bilateral-hs4', 'seed-meta:comtrade:bilateral-hs4', 50400],
   ['sharedFxRates', 'shared:fx-rates:v1', 'seed-meta:shared:fx-rates', 3600],
   ['submarineCables', 'infrastructure:submarine-cables:v1', 'seed-meta:infrastructure:submarine-cables', 25200],
 ];
@@ -263,7 +281,7 @@ test('classifyKey: issue #5055 Comtrade bilateral probe is explicitly meta-only'
   assert.equal(STANDALONE_KEYS.comtradeBilateralHs4, metaKey);
   assert.equal(entry.status, 'OK');
   assert.equal(entry.records, 180);
-  assert.equal(entry.maxStaleMin, 34560);
+  assert.equal(entry.maxStaleMin, 50400);
 });
 
 test('classifyKey: empty on-demand standalone key → EMPTY_ON_DEMAND (warn)', () => {

@@ -32,6 +32,8 @@ const JSON_MEDIA = 'application/json';
 const HTTP_METHODS = new Set(['get', 'post', 'put', 'delete', 'patch', 'options', 'head']);
 const MAX_OBJECT_DEPTH = 6;
 const MAX_OPTIONAL_PROPERTIES = 5;
+const CHINA_CORRIDOR_PATH = '/api/supply-chain/v1/get-china-corridor-control-towers';
+const CHINA_DECISION_SIGNALS_PATH = '/api/intelligence/v1/get-china-decision-signals';
 
 // ── Curated per-parameter example overrides ───────────────────────────────
 // The field-name heuristic in stringExample() picks structurally-valid but
@@ -733,6 +735,11 @@ function injectSpecExamples(spec) {
       if (responses.length > 0) responseOperations++;
       for (const [, response] of responses) {
         const media = response.content[JSON_MEDIA];
+        // This response carries a canonical JSON document inside payloadJson.
+        // Its dedicated injector owns a representative decoded example; keep
+        // that curated example stable when the generic examples pass is
+        // re-run or checked after code generation.
+        if ((path === CHINA_CORRIDOR_PATH || path === CHINA_DECISION_SIGNALS_PATH) && media.example !== undefined) continue;
         const example = exampleForSchema(media.schema, spec, {
           ...context,
           name: `${op.operationId ?? 'operation'}Response`,
