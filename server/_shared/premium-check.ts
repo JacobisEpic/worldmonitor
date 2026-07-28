@@ -86,13 +86,20 @@ export async function resolvePremiumCallerIdentity(request: Request): Promise<Pr
 
     // Check user-owned API keys (wm_ prefix) via Convex lookup.
     // Key existence alone is not sufficient — verify the owner's entitlement.
-    const userKey = await validateUserApiKey(wmKey);
-    if (userKey) {
-      const ent = await getEntitlements(userKey.userId);
-      if (ent && ent.features.apiAccess === true) {
-        return { isPremium: true, userId: userKey.userId, kind: 'user-api-key', quotaExempt: false };
+    // Transient validation outages throw UserApiKeyUnavailableError — do not
+    // treat them as invalid keys; fall through so a co-present bearer can still
+    // grant premium, and fail closed for the user-key path itself.
+    try {
+      const userKey = await validateUserApiKey(wmKey);
+      if (userKey) {
+        const ent = await getEntitlements(userKey.userId);
+        if (ent && ent.features.apiAccess === true) {
+          return { isPremium: true, userId: userKey.userId, kind: 'user-api-key', quotaExempt: false };
+        }
+        return { isPremium: false, userId: null, kind: null, quotaExempt: false };
       }
-      return { isPremium: false, userId: null, kind: null, quotaExempt: false };
+    } catch {
+      // Unavailable: leave the user-key path without granting premium.
     }
   }
 
