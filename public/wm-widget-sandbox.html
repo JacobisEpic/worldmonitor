@@ -51,11 +51,29 @@
     }
   }
 
+  function installBeforeUnloadGuard() {
+    Object.defineProperty(window, 'onbeforeunload', {
+      configurable: false,
+      get: function () {
+        return null;
+      },
+      set: function () {},
+    });
+
+    var addEventListener = EventTarget.prototype.addEventListener;
+    EventTarget.prototype.addEventListener = function (type, listener, options) {
+      if (this === window && type === 'beforeunload') return;
+      return addEventListener.call(this, type, listener, options);
+    };
+  }
+
   try {
     parentOrigin = document.referrer ? new URL(document.referrer).origin : '';
   } catch (_err) {
     parentOrigin = '';
   }
+
+  installBeforeUnloadGuard();
 
   window.addEventListener('message', function (e) {
     if (handled) return;
