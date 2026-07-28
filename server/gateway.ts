@@ -1207,7 +1207,11 @@ export function createDomainGateway(
         return validationGuardResponse;
       }
 
-      const { validateUserApiKey, isUserApiKeyUnavailableError } = await import('./_shared/user-api-key');
+      // Only destructure validateUserApiKey: several gateway unit tests mock this
+      // module with a partial surface. Requiring isUserApiKeyUnavailableError at
+      // import time breaks those mocks (vitest throws "No export is defined").
+      // Classify unavailability by the stable `code` field instead.
+      const { validateUserApiKey } = await import('./_shared/user-api-key');
       try {
         const userKeyResult = await validateUserApiKey(wmKey);
         if (userKeyResult) {
@@ -1233,7 +1237,12 @@ export function createDomainGateway(
         // Transient Convex validation outage must not look like an invalid key.
         // Mirror api/_user-api-key.js serviceUnavailable() (503 + Retry-After +
         // X-Validation-Mode: degraded) so clients retry instead of rotating keys.
-        if (isUserApiKeyUnavailableError(err)) {
+        // Duck-type on `code` so partial test mocks of user-api-key still work.
+        const code =
+          typeof err === 'object' && err !== null
+            ? (err as { code?: unknown }).code
+            : undefined;
+        if (code === 'validation_unavailable') {
           emitRequest(503, 'validation_unavailable', null);
           return new Response(JSON.stringify({ error: 'Service temporarily unavailable' }), {
             status: 503,
