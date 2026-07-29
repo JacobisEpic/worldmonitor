@@ -79,11 +79,26 @@ function appendNotificationError(rowEl: HTMLElement, message: string): void {
 
 type WebPushSettingsState = 'available' | 'denied' | 'unsupported';
 
+const WEB_PUSH_BLOCKED_BADGE = 'Blocked';
+const WEB_PUSH_UNSUPPORTED_BADGE = 'Not supported';
+
 function browserPushBlockedMessage(): string {
   return t('components.proActivation.steps.alerts.blockedNote', {
     defaultValue:
       "Notifications are blocked in your browser. Turn them on in your browser's site settings to get alerts.",
   });
+}
+
+function browserPushUnsupportedMessage(): string {
+  return 'This browser or in-app webview does not support web push notifications.';
+}
+
+// User-Agent is long and ugly. Surface a short label only: "Chrome",
+// "Firefox", "Safari", etc. Shared by the connected row and the
+// connected-but-denied row so the two can't drift.
+function webPushDeviceLabel(channel: NotificationChannel): string {
+  const ua = channel.userAgent ?? '';
+  return /Firefox\/|Chrome\/|Edge\/|Safari\//.exec(ua)?.[0]?.replace('/', '') ?? 'This device';
 }
 
 async function readWebPushSettingsState(): Promise<WebPushSettingsState> {
@@ -96,40 +111,57 @@ async function readWebPushSettingsState(): Promise<WebPushSettingsState> {
   }
 }
 
-function showWebPushBlockedState(rowEl: HTMLElement): void {
-  rowEl.dataset.webPushState = 'denied';
+// Single writer for the two runtime web-push transitions, so the imperative
+// path can't drift from the equivalent template branches in renderChannelRow.
+function applyWebPushRowState(
+  rowEl: HTMLElement,
+  state: 'denied' | 'unsupported',
+  message: string,
+  badgeClass: string,
+  badgeLabel: string,
+): void {
+  rowEl.dataset.webPushState = state;
   rowEl.querySelector('.us-notif-error')?.remove();
   const sub = rowEl.querySelector<HTMLElement>('.us-notif-ch-sub');
   if (sub) {
-    sub.textContent = browserPushBlockedMessage();
+    // Role FIRST: a live region that is created already-populated has no
+    // content change for assistive tech to announce.
+    if (state === 'denied') sub.setAttribute('role', 'status');
+    else sub.removeAttribute('role');
     sub.classList.add('us-notif-ch-sub-wrap');
-    sub.setAttribute('role', 'status');
+    sub.textContent = message;
   }
   const actions = rowEl.querySelector<HTMLElement>('.us-notif-ch-actions');
   if (actions) {
     const badge = document.createElement('span');
-    badge.className = 'us-notif-ch-badge us-notif-ch-badge-blocked';
-    badge.textContent = 'Blocked';
+    badge.className = badgeClass;
+    badge.textContent = badgeLabel;
+    // Preserve Remove: a channel registered on this account stays removable
+    // even once this browser can no longer subscribe.
+    const remove = actions.querySelector('.us-notif-disconnect');
     actions.replaceChildren(badge);
+    if (remove) actions.appendChild(remove);
   }
 }
 
+function showWebPushBlockedState(rowEl: HTMLElement): void {
+  applyWebPushRowState(
+    rowEl,
+    'denied',
+    browserPushBlockedMessage(),
+    'us-notif-ch-badge us-notif-ch-badge-blocked',
+    WEB_PUSH_BLOCKED_BADGE,
+  );
+}
+
 function showWebPushUnsupportedState(rowEl: HTMLElement): void {
-  rowEl.dataset.webPushState = 'unsupported';
-  rowEl.querySelector('.us-notif-error')?.remove();
-  const sub = rowEl.querySelector<HTMLElement>('.us-notif-ch-sub');
-  if (sub) {
-    sub.textContent = 'This browser or in-app webview does not support web push notifications.';
-    sub.classList.add('us-notif-ch-sub-wrap');
-    sub.removeAttribute('role');
-  }
-  const actions = rowEl.querySelector<HTMLElement>('.us-notif-ch-actions');
-  if (actions) {
-    const badge = document.createElement('span');
-    badge.className = 'us-notif-ch-badge';
-    badge.textContent = 'Not supported';
-    actions.replaceChildren(badge);
-  }
+  applyWebPushRowState(
+    rowEl,
+    'unsupported',
+    browserPushUnsupportedMessage(),
+    'us-notif-ch-badge',
+    WEB_PUSH_UNSUPPORTED_BADGE,
+  );
 }
 
 function getTelegramBotUsername(): string {
@@ -212,9 +244,31 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         const name = CHANNEL_LABELS[type];
 
         if (type === 'web_push' && webPushState === 'denied') {
-          const removeAction = channel?.verified
-            ? '<button type="button" class="us-notif-ch-btn us-notif-disconnect" data-channel="web_push">Remove</button>'
-            : '';
+          // Push permission is per-BROWSER; the web_push channel record is
+          // per-ACCOUNT (convex keys it by userId + channelType and transfers
+          // it across devices). So a denial here says nothing about whether the
+          // account is receiving push — it may be live on another device.
+          //
+          // A connected account therefore keeps the connected presentation, and
+          // critically keeps `us-notif-ch-on`: getCurrentAlertRuleFormState()
+          // derives the persisted `channels` array from that class, so dropping
+          // it would silently delete web_push from the alert rule on the next
+          // autosave (sensitivity, quiet hours, country picker, connecting any
+          // other channel...) with no way to re-add it while denied.
+          if (channel?.verified) {
+            return `<div class="us-notif-ch-row us-notif-ch-on" data-channel-type="web_push" data-web-push-state="denied">
+              <div class="us-notif-ch-icon">${icon}</div>
+              <div class="us-notif-ch-body">
+                <div class="us-notif-ch-name">${name}</div>
+                <div class="us-notif-ch-sub">${escapeHtml(webPushDeviceLabel(channel))}</div>
+                <div class="us-notif-ch-sub us-notif-ch-sub-wrap us-notif-ch-sub-warn" role="status">${escapeHtml(browserPushBlockedMessage())}</div>
+              </div>
+              <div class="us-notif-ch-actions">
+                <span class="us-notif-ch-badge">Connected</span>
+                <button type="button" class="us-notif-ch-btn us-notif-disconnect" data-channel="web_push">Remove</button>
+              </div>
+            </div>`;
+          }
           return `<div class="us-notif-ch-row" data-channel-type="web_push" data-web-push-state="denied">
             <div class="us-notif-ch-icon">${icon}</div>
             <div class="us-notif-ch-body">
@@ -222,8 +276,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
               <div class="us-notif-ch-sub us-notif-ch-sub-wrap" role="status">${escapeHtml(browserPushBlockedMessage())}</div>
             </div>
             <div class="us-notif-ch-actions">
-              <span class="us-notif-ch-badge us-notif-ch-badge-blocked">Blocked</span>
-              ${removeAction}
+              <span class="us-notif-ch-badge us-notif-ch-badge-blocked">${WEB_PUSH_BLOCKED_BADGE}</span>
             </div>
           </div>`;
         }
@@ -240,11 +293,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
           } else if (type === 'webhook') {
             sub = channel.webhookLabel ? escapeHtml(channel.webhookLabel) : 'Connected';
           } else if (type === 'web_push') {
-            // User-Agent is long and ugly. Surface a short label only:
-            // "Chrome", "Firefox", "Safari", etc.
-            const ua = channel.userAgent ?? '';
-            const browser = /Firefox\/|Chrome\/|Edge\/|Safari\//.exec(ua)?.[0]?.replace('/', '') ?? 'This device';
-            sub = escapeHtml(browser);
+            sub = escapeHtml(webPushDeviceLabel(channel));
           } else {
             const rawCh = channel.slackChannelName ?? '';
             const ch = rawCh ? `#${escapeHtml(rawCh.startsWith('#') ? rawCh.slice(1) : rawCh)}` : 'connected';
@@ -345,10 +394,10 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
               <div class="us-notif-ch-icon">${icon}</div>
               <div class="us-notif-ch-body">
                 <div class="us-notif-ch-name">${name}</div>
-                <div class="us-notif-ch-sub us-notif-ch-sub-wrap">This browser or in-app webview does not support web push notifications.</div>
+                <div class="us-notif-ch-sub us-notif-ch-sub-wrap">${escapeHtml(browserPushUnsupportedMessage())}</div>
               </div>
               <div class="us-notif-ch-actions">
-                <span class="us-notif-ch-badge">Not supported</span>
+                <span class="us-notif-ch-badge">${WEB_PUSH_UNSUPPORTED_BADGE}</span>
               </div>
             </div>`;
           }
@@ -549,6 +598,10 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
       let qhDebounceTimer: ReturnType<typeof setTimeout> | null = null;
       let digestDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+      // Last web-push state actually rendered, so the permission watchers below
+      // only re-render when it really changed.
+      let renderedWebPushState: WebPushSettingsState | null = null;
+
       // Fire-and-forget settings writes MUST NOT surface as unhandled promise
       // rejections. A debounced auto-save that 401s (expired Clerk session) or
       // hits a transient network error is expected and non-fatal — swallow it
@@ -573,6 +626,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
           readWebPushSettingsState(),
         ]).then(([data, webPushState]) => {
           if (signal.aborted) return;
+          renderedWebPushState = webPushState;
           setTrustedHtml(contentEl, trustedHtml(renderNotifContent(data, webPushState), "legacy direct innerHTML migration"));
           loadingEl.style.display = 'none';
           contentEl.style.display = 'block';
@@ -694,6 +748,42 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
       }
 
       reloadNotifSection();
+
+      // The blocked copy sends the user to their BROWSER's site settings, which
+      // is an in-page action: nothing here remounts afterwards (a settings
+      // tab-switch is a guarded no-op in UnifiedSettings.attachNotificationsTab).
+      // Without a watcher the row would stay on "Blocked" with no Enable button
+      // after the user did exactly what we asked, so re-read the permission and
+      // re-render when it actually changes.
+      function resyncWebPushState(): void {
+        if (signal.aborted) return;
+        void readWebPushSettingsState().then((state) => {
+          if (signal.aborted) return;
+          if (renderedWebPushState === null || state === renderedWebPushState) return;
+          // Claim the new state before the async reload lands so the permission
+          // listener and the focus fallback firing together only re-render once.
+          renderedWebPushState = state;
+          reloadNotifSection();
+        });
+      }
+
+      // Chromium/Firefox fire this the moment the site-settings toggle flips.
+      void (async () => {
+        try {
+          const status = await navigator.permissions.query({
+            name: 'notifications' as PermissionName,
+          });
+          if (signal.aborted) return;
+          status.addEventListener('change', resyncWebPushState, { signal });
+        } catch {
+          // Safari and older browsers don't expose the notifications
+          // permission descriptor — the focus fallback below covers them.
+        }
+      })();
+
+      // Fallback for browsers without the permission descriptor: changing site
+      // settings there takes focus away and returns it.
+      window.addEventListener('focus', resyncWebPushState, { signal });
 
       function saveRuleWithNewChannel(newChannel: ChannelType): void {
         const state = getCurrentAlertRuleFormState();
@@ -1107,7 +1197,17 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
 
         if (target.closest('#usConnectWebPush')) {
           const btn = target.closest<HTMLButtonElement>('#usConnectWebPush');
-          const rowEl = btn?.closest<HTMLElement>('[data-channel-type="web_push"]') ?? null;
+          // Re-query rather than capture: Notification.requestPermission() has
+          // no timeout, and any sibling channel action (webhook cancel/save,
+          // email connect, a disconnect, a Slack/Discord OAuth message, the
+          // Telegram pairing poll) can call reloadNotifSection() meanwhile,
+          // which replaces the whole content subtree. A node captured before
+          // the prompt would then be detached and the blocked/unsupported/error
+          // result would be written somewhere the user can never see.
+          const liveRow = (): HTMLElement | null =>
+            container.querySelector<HTMLElement>('[data-channel-type="web_push"]');
+          const liveBtn = (): HTMLButtonElement | null =>
+            container.querySelector<HTMLButtonElement>('#usConnectWebPush');
           if (btn) {
             btn.disabled = true;
             btn.textContent = 'Requesting…';
@@ -1116,12 +1216,15 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             let pushRuntime: typeof import('@/services/push-notifications') | null = null;
             try {
               pushRuntime = await import('@/services/push-notifications');
+              if (signal.aborted) return;
               if (!pushRuntime.isWebPushSupported()) {
-                if (rowEl && !signal.aborted) showWebPushUnsupportedState(rowEl);
+                const row = liveRow();
+                if (row) showWebPushUnsupportedState(row);
                 return;
               }
               if (pushRuntime.getPushPermission() === 'denied') {
-                if (rowEl && !signal.aborted) showWebPushBlockedState(rowEl);
+                const row = liveRow();
+                if (row) showWebPushBlockedState(row);
                 return;
               }
               await pushRuntime.subscribeToPush();
@@ -1129,22 +1232,24 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             } catch (err) {
               console.warn('[notif] web_push subscribe failed:', err);
               if (signal.aborted) return;
+              const row = liveRow();
               const permission = pushRuntime?.getPushPermission();
               if (permission === 'denied') {
-                if (rowEl) showWebPushBlockedState(rowEl);
+                if (row) showWebPushBlockedState(row);
                 return;
               }
               if (pushRuntime && !pushRuntime.isWebPushSupported()) {
-                if (rowEl) showWebPushUnsupportedState(rowEl);
+                if (row) showWebPushUnsupportedState(row);
                 return;
               }
-              if (btn) {
-                btn.disabled = false;
-                btn.textContent = 'Enable';
+              const enableBtn = liveBtn();
+              if (enableBtn) {
+                enableBtn.disabled = false;
+                enableBtn.textContent = 'Enable';
               }
-              if (rowEl) {
+              if (row) {
                 appendNotificationError(
-                  rowEl,
+                  row,
                   'Could not enable browser notifications. Try again.',
                 );
               }

@@ -13,6 +13,7 @@ const pushState = vi.hoisted(() => ({
 const channelMocks = vi.hoisted(() => ({
   getChannelsData: vi.fn(),
   saveAlertRules: vi.fn(),
+  deleteChannel: vi.fn(),
 }));
 
 vi.mock('@/services/push-notifications', () => ({
@@ -30,7 +31,7 @@ vi.mock('@/services/notification-channels', () => ({
   setWebhookChannel: vi.fn(),
   startSlackOAuth: vi.fn(),
   startDiscordOAuth: vi.fn(),
-  deleteChannel: vi.fn(),
+  deleteChannel: channelMocks.deleteChannel,
   setQuietHours: vi.fn(),
   setDigestSettings: vi.fn(),
   setNotificationConfig: vi.fn(),
@@ -65,6 +66,17 @@ vi.mock('uqr', () => ({
 import { renderNotificationsSettings } from '@/services/notifications-settings';
 
 const EMPTY_DATA: ChannelsData = { channels: [], alertRules: [] };
+const CONNECTED_WEB_PUSH: ChannelsData = {
+  channels: [
+    {
+      channelType: 'web_push',
+      verified: true,
+      linkedAt: 1,
+      userAgent: 'Chrome/140.0',
+    },
+  ],
+  alertRules: [],
+};
 const cleanups: Array<() => void> = [];
 
 async function mount(data: ChannelsData = EMPTY_DATA): Promise<HTMLElement> {
@@ -106,6 +118,8 @@ beforeEach(() => {
   channelMocks.getChannelsData.mockReset();
   channelMocks.saveAlertRules.mockReset();
   channelMocks.saveAlertRules.mockResolvedValue(undefined);
+  channelMocks.deleteChannel.mockReset();
+  channelMocks.deleteChannel.mockResolvedValue(undefined);
 });
 
 afterAll(() => {
@@ -241,17 +255,7 @@ describe('notification Settings browser push', () => {
 
   it('preserves the connected browser display while permission is usable', async () => {
     pushState.permission = 'granted';
-    const container = await mount({
-      channels: [
-        {
-          channelType: 'web_push',
-          verified: true,
-          linkedAt: 1,
-          userAgent: 'Chrome/140.0',
-        },
-      ],
-      alertRules: [],
-    });
+    const container = await mount(CONNECTED_WEB_PUSH);
     const row = webPushRow(container);
 
     expect(row.classList.contains('us-notif-ch-on')).toBe(true);
@@ -260,26 +264,145 @@ describe('notification Settings browser push', () => {
     expect(row.querySelector('#usConnectWebPush')).toBeNull();
   });
 
-  it('keeps Remove available while warning a connected browser that permission is denied', async () => {
+  it('keeps a connected account connected while warning that this browser is denied', async () => {
     pushState.permission = 'denied';
-    const container = await mount({
-      channels: [
-        {
-          channelType: 'web_push',
-          verified: true,
-          linkedAt: 1,
-          userAgent: 'Chrome/140.0',
-        },
-      ],
-      alertRules: [],
-    });
+    const container = await mount(CONNECTED_WEB_PUSH);
     const row = webPushRow(container);
 
     expect(row.dataset.webPushState).toBe('denied');
-    expect(row.querySelector('.us-notif-ch-sub')?.textContent).toBe(
-      tt('components.proActivation.steps.alerts.blockedNote'),
-    );
+    // Permission is per-browser; the channel record is per-account. A denial
+    // here must not present the account as disconnected.
+    expect(row.classList.contains('us-notif-ch-on')).toBe(true);
+    expect(row.querySelector('.us-notif-ch-badge')?.textContent).toBe('Connected');
     expect(row.querySelector('.us-notif-disconnect')).not.toBeNull();
     expect(row.querySelector('#usConnectWebPush')).toBeNull();
+
+    const subs = Array.from(row.querySelectorAll('.us-notif-ch-sub')).map(el => el.textContent);
+    expect(subs[0]).toBe('Chrome');
+    expect(subs[1]).toBe(tt('components.proActivation.steps.alerts.blockedNote'));
+  });
+
+  it('keeps web_push in the saved alert rule when this browser is denied', async () => {
+    // Regression: the denied row used to drop `us-notif-ch-on`, and
+    // getCurrentAlertRuleFormState derives the persisted `channels` array from
+    // that class -- so any incidental autosave silently deleted browser push
+    // from the rule, account-wide, with no way to re-add it while denied.
+    pushState.permission = 'denied';
+    const container = await mount(CONNECTED_WEB_PUSH);
+    expect(webPushRow(container).classList.contains('us-notif-ch-on')).toBe(true);
+
+    const sensitivity = container.querySelector<HTMLSelectElement>('#usNotifSensitivity');
+    expect(sensitivity).not.toBeNull();
+    sensitivity!.value = 'high';
+    sensitivity!.dispatchEvent(new Event('change', { bubbles: true }));
+
+    await vi.waitFor(
+      () => {
+        expect(channelMocks.saveAlertRules).toHaveBeenCalledTimes(1);
+      },
+      { timeout: 4000 },
+    );
+    expect(channelMocks.saveAlertRules.mock.calls[0]?.[0]?.channels).toContain('web_push');
+  });
+
+  it('restores the Enable action when permission is re-granted in browser settings', async () => {
+    // The blocked copy sends the user to BROWSER site settings, which never
+    // remounts this panel. Without a permission re-sync the row would stay on
+    // "Blocked" after the user did exactly what we asked.
+    pushState.permission = 'denied';
+    const container = await mount();
+    expect(webPushRow(container).querySelector('#usConnectWebPush')).toBeNull();
+
+    pushState.permission = 'granted';
+    window.dispatchEvent(new Event('focus'));
+
+    await vi.waitFor(() => {
+      expect(webPushRow(container).dataset.webPushState).toBe('available');
+    });
+    expect(webPushRow(container).querySelector('#usConnectWebPush')).not.toBeNull();
+  });
+
+  it('shows unsupported guidance when support disappears during the subscribe', async () => {
+    const container = await mount();
+    pushState.subscribeToPush.mockImplementation(async () => {
+      pushState.supported = false;
+      pushState.permission = 'unsupported';
+      throw new Error('push manager went away');
+    });
+
+    container.querySelector<HTMLButtonElement>('#usConnectWebPush')!.click();
+
+    await vi.waitFor(() => {
+      expect(webPushRow(container).dataset.webPushState).toBe('unsupported');
+    });
+    const row = webPushRow(container);
+    expect(row.textContent).toContain('Not supported');
+    expect(row.querySelector('.us-notif-error')).toBeNull();
+    expect(channelMocks.saveAlertRules).not.toHaveBeenCalled();
+  });
+
+  it('writes the failure result into the live row after a concurrent reload', async () => {
+    // reloadNotifSection() replaces the whole content subtree. A row captured
+    // before the (untimed) permission prompt would be detached by the time the
+    // result lands, so the guidance would be written where nobody can see it.
+    pushState.permission = 'default';
+    const container = await mount({
+      channels: [
+        { channelType: 'email', verified: true, linkedAt: 1, email: 'a@b.test' },
+      ],
+      alertRules: [],
+    });
+
+    let rejectSubscribe: ((err: Error) => void) | undefined;
+    pushState.subscribeToPush.mockImplementation(
+      () => new Promise((_resolve, reject) => { rejectSubscribe = reject; }),
+    );
+
+    const originalRow = webPushRow(container);
+    container.querySelector<HTMLButtonElement>('#usConnectWebPush')!.click();
+    await vi.waitFor(() => {
+      expect(rejectSubscribe).toBeDefined();
+    });
+
+    // Sibling action re-renders the section while the subscribe is in flight.
+    container.querySelector<HTMLElement>('.us-notif-disconnect[data-channel="email"]')!.click();
+    await vi.waitFor(() => {
+      expect(webPushRow(container)).not.toBe(originalRow);
+    });
+
+    pushState.permission = 'denied';
+    rejectSubscribe!(new Error('permission rejected'));
+
+    await vi.waitFor(() => {
+      expect(webPushRow(container).dataset.webPushState).toBe('denied');
+    });
+    expect(webPushRow(container).isConnected).toBe(true);
+  });
+
+  it('leaves the row untouched when the panel is torn down mid-subscribe', async () => {
+    const container = await mount();
+
+    let rejectSubscribe: ((err: Error) => void) | undefined;
+    pushState.subscribeToPush.mockImplementation(
+      () => new Promise((_resolve, reject) => { rejectSubscribe = reject; }),
+    );
+
+    container.querySelector<HTMLButtonElement>('#usConnectWebPush')!.click();
+    await vi.waitFor(() => {
+      expect(rejectSubscribe).toBeDefined();
+    });
+
+    // Abort the section (what UnifiedSettings does on teardown).
+    cleanups.pop()?.();
+
+    pushState.permission = 'denied';
+    rejectSubscribe!(new Error('permission rejected'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const row = webPushRow(container);
+    expect(row.dataset.webPushState).toBe('available');
+    expect(row.querySelector('.us-notif-error')).toBeNull();
+    expect(channelMocks.saveAlertRules).not.toHaveBeenCalled();
   });
 });

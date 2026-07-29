@@ -481,11 +481,12 @@ export function openProActivationInterstitial(options: ProActivationInterstitial
           ? t('components.proActivation.summary.lineFailed', {
               defaultValue: "We couldn't set this up — try again from settings.",
             })
-          : line.outcome === 'blocked' && line.id === 'alerts'
-            ? t('components.proActivation.steps.alerts.blockedNote', {
-                defaultValue:
-                  "Notifications are blocked in your browser. Turn them on in your browser's site settings to get alerts.",
-              })
+          : line.outcome === 'blocked'
+            ? // Reuse the single per-step-id source of truth (blockedNote also
+              // handles ids other than 'alerts' with generic copy) so a future
+              // blockable step can never fall through to the app-settings
+              // promise this branch exists to avoid.
+              blockedNote(line.id, false)
           : t('components.proActivation.summary.linePending', {
               defaultValue: 'Not set up yet — finish any time in settings.',
             });

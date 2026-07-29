@@ -26550,6 +26550,10 @@ body.map-width-resizing {
   white-space: normal;
 }
 
+.us-notif-ch-sub-warn {
+  color: var(--settings-red);
+}
+
 .us-notif-ch-actions {
   display: flex;
   align-items: center;
