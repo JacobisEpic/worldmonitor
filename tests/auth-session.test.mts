@@ -6,10 +6,12 @@
  *  - Valid Pro token → { valid: true, role: 'pro' }
  *  - Valid Free token → { valid: true, role: 'free' }
  *  - Missing plan claim → defaults to 'free'
- *  - Expired token → { valid: false }
+ *  - Small JWT clock skew → accepted within the bounded tolerance on both verification paths
+ *  - Expired token beyond the tolerance → { valid: false, reason: 'invalid' }
  *  - Invalid signature → { valid: false }
  *  - Allowed audiences → accepted ('convex' template plus configured publishable/audience envs)
  *  - Unexpected audience → rejected
+ *  - JWKS transport failure → { valid: false, reason: 'unverifiable' }
  *  - JWKS resolver is reused across calls (module-scoped, not per-request)
  */
 
@@ -18,6 +20,15 @@ import { createServer, type Server } from 'node:http';
 import { describe, it, before, after } from 'node:test';
 import { generateKeyPair, exportJWK, SignJWT } from 'jose';
 
+const EXPECTED_CLOCK_TOLERANCE_SECONDS = 5;
+
+type AuthSessionResult = {
+  valid: boolean;
+  userId?: string;
+  role?: string;
+  reason?: 'invalid' | 'unverifiable';
+};
+
 // ---------------------------------------------------------------------------
 // Suite 1: fail-closed when CLERK_JWT_ISSUER_DOMAIN is NOT set
 // ---------------------------------------------------------------------------
@@ -25,7 +36,7 @@ import { generateKeyPair, exportJWK, SignJWT } from 'jose';
 // Clear env BEFORE dynamic import so the module captures an empty domain
 delete process.env.CLERK_JWT_ISSUER_DOMAIN;
 
-let validateBearerTokenNoEnv: (token: string) => Promise<{ valid: boolean; userId?: string; role?: string }>;
+let validateBearerTokenNoEnv: (token: string) => Promise<AuthSessionResult>;
 
 before(async () => {
   const mod = await import('../server/auth-session.ts');
@@ -63,7 +74,9 @@ describe('validateBearerToken (with JWKS)', () => {
   let privateKey: CryptoKey;
   let jwksServer: Server;
   let jwksPort: number;
-  let validateBearerToken: (token: string) => Promise<{ valid: boolean; userId?: string; role?: string }>;
+  let validateBearerToken: (token: string) => Promise<AuthSessionResult>;
+  let getClerkJwtVerifyOptions: () => { clockTolerance?: string | number };
+  let originalClerkSecretKey: string | undefined;
 
   // Separate key pair for "wrong key" tests
   let wrongPrivateKey: CryptoKey;
@@ -104,28 +117,49 @@ describe('validateBearerToken (with JWKS)', () => {
     // (fresh import since the module caches JWKS at first use)
     process.env.CLERK_JWT_ISSUER_DOMAIN = `http://127.0.0.1:${jwksPort}`;
     process.env.CLERK_PUBLISHABLE_KEY = 'pk_test_123';
+    originalClerkSecretKey = process.env.CLERK_SECRET_KEY;
+    delete process.env.CLERK_SECRET_KEY;
 
     // Dynamic import with cache-busting query param to get a fresh module instance
     const mod = await import(`../server/auth-session.ts?t=${Date.now()}`);
     validateBearerToken = mod.validateBearerToken;
+    getClerkJwtVerifyOptions = mod.getClerkJwtVerifyOptions;
   });
 
   after(async () => {
     jwksServer?.close();
     delete process.env.CLERK_JWT_ISSUER_DOMAIN;
     delete process.env.CLERK_PUBLISHABLE_KEY;
+    if (originalClerkSecretKey === undefined) {
+      delete process.env.CLERK_SECRET_KEY;
+    } else {
+      process.env.CLERK_SECRET_KEY = originalClerkSecretKey;
+    }
   });
 
   /** Helper to sign a JWT with the test private key */
-  function signToken(claims: Record<string, unknown>, opts?: { expiresIn?: string; key?: CryptoKey }) {
+  function signToken(
+    claims: Record<string, unknown>,
+    opts?: {
+      audience?: string | null;
+      expiresAt?: number;
+      expiresIn?: string;
+      key?: CryptoKey;
+    },
+  ) {
     const builder = new SignJWT(claims)
       .setProtectedHeader({ alg: 'RS256', kid: 'test-key-1' })
       .setIssuer(`http://127.0.0.1:${jwksPort}`)
-      .setAudience('convex')
       .setSubject(claims.sub as string ?? 'user_test123')
       .setIssuedAt();
 
-    if (opts?.expiresIn) {
+    if (opts?.audience !== null) {
+      builder.setAudience(opts?.audience ?? 'convex');
+    }
+
+    if (opts?.expiresAt !== undefined) {
+      builder.setExpirationTime(opts.expiresAt);
+    } else if (opts?.expiresIn) {
       builder.setExpirationTime(opts.expiresIn);
     } else {
       builder.setExpirationTime('1h');
@@ -133,6 +167,13 @@ describe('validateBearerToken (with JWKS)', () => {
 
     return builder.sign(opts?.key ?? privateKey);
   }
+
+  it('exposes the intentionally bounded JWT clock tolerance', () => {
+    assert.equal(
+      getClerkJwtVerifyOptions().clockTolerance,
+      EXPECTED_CLOCK_TOLERANCE_SECONDS,
+    );
+  });
 
   it('accepts a valid Pro token', async () => {
     const token = await signToken({ sub: 'user_pro1', plan: 'pro' });
@@ -166,24 +207,37 @@ describe('validateBearerToken (with JWKS)', () => {
     assert.equal(result.role, 'free');
   });
 
-  it('rejects an expired token', async () => {
-    const token = await new SignJWT({ sub: 'user_expired', plan: 'pro' })
-      .setProtectedHeader({ alg: 'RS256', kid: 'test-key-1' })
-      .setIssuer(`http://127.0.0.1:${jwksPort}`)
-      .setAudience('convex')
-      .setSubject('user_expired')
-      .setIssuedAt(Math.floor(Date.now() / 1000) - 7200) // 2h ago
-      .setExpirationTime(Math.floor(Date.now() / 1000) - 3600) // expired 1h ago
-      .sign(privateKey);
+  it('accepts an audience-bearing token expired within the clock tolerance', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signToken(
+      { sub: 'user_aud_within_tolerance', plan: 'pro' },
+      { expiresAt: now - 1 },
+    );
 
     const result = await validateBearerToken(token);
-    assert.equal(result.valid, false);
+    assert.equal(result.valid, true);
+    assert.equal(result.userId, 'user_aud_within_tolerance');
+  });
+
+  it('rejects an audience-bearing token expired beyond the clock tolerance', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signToken(
+      { sub: 'user_aud_beyond_tolerance', plan: 'pro' },
+      { expiresAt: now - 8 },
+    );
+
+    assert.deepEqual(
+      await validateBearerToken(token),
+      { valid: false, reason: 'invalid' },
+    );
   });
 
   it('rejects a token signed with wrong key', async () => {
     const token = await signToken({ sub: 'user_wrongkey', plan: 'pro' }, { key: wrongPrivateKey });
-    const result = await validateBearerToken(token);
-    assert.equal(result.valid, false);
+    assert.deepEqual(
+      await validateBearerToken(token),
+      { valid: false, reason: 'invalid' },
+    );
   });
 
   it('accepts a token with the configured publishable-key audience', async () => {
@@ -211,12 +265,14 @@ describe('validateBearerToken (with JWKS)', () => {
       .setExpirationTime('1h')
       .sign(privateKey);
 
-    const result = await validateBearerToken(token);
-    assert.equal(result.valid, false);
+    assert.deepEqual(
+      await validateBearerToken(token),
+      { valid: false, reason: 'invalid' },
+    );
   });
 
   it('accepts a standard Clerk token with no aud claim (fallback path)', async () => {
-    const token = await new SignJWT({ sub: 'user_noaud', plan: 'pro' })
+    const token = await new SignJWT({ sub: 'user_noaud' })
       .setProtectedHeader({ alg: 'RS256', kid: 'test-key-1' })
       .setIssuer(`http://127.0.0.1:${jwksPort}`)
       .setSubject('user_noaud')
@@ -227,6 +283,33 @@ describe('validateBearerToken (with JWKS)', () => {
     const result = await validateBearerToken(token);
     assert.equal(result.valid, true, 'standard Clerk tokens without aud should be accepted');
     assert.equal(result.userId, 'user_noaud');
+    assert.equal(result.role, 'free');
+  });
+
+  it('accepts a no-audience token expired within the clock tolerance through the fallback path', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signToken(
+      { sub: 'user_noaud_within_tolerance' },
+      { audience: null, expiresAt: now - 1 },
+    );
+
+    const result = await validateBearerToken(token);
+    assert.equal(result.valid, true);
+    assert.equal(result.userId, 'user_noaud_within_tolerance');
+    assert.equal(result.role, 'free');
+  });
+
+  it('rejects a no-audience token expired beyond the clock tolerance', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signToken(
+      { sub: 'user_noaud_beyond_tolerance' },
+      { audience: null, expiresAt: now - 8 },
+    );
+
+    assert.deepEqual(
+      await validateBearerToken(token),
+      { valid: false, reason: 'invalid' },
+    );
   });
 
   it('extracts email and name from JWT for checkout prefill', async () => {
@@ -277,8 +360,10 @@ describe('validateBearerToken (with JWKS)', () => {
       .setExpirationTime('1h')
       .sign(privateKey);
 
-    const result = await validateBearerToken(token);
-    assert.equal(result.valid, false);
+    assert.deepEqual(
+      await validateBearerToken(token),
+      { valid: false, reason: 'invalid' },
+    );
   });
 
   it('rejects a token with no sub claim', async () => {
@@ -290,8 +375,47 @@ describe('validateBearerToken (with JWKS)', () => {
       .setExpirationTime('1h')
       .sign(privateKey);
 
-    const result = await validateBearerToken(token);
-    assert.equal(result.valid, false);
+    assert.deepEqual(
+      await validateBearerToken(token),
+      { valid: false, reason: 'invalid' },
+    );
+  });
+
+  it('classifies a JWKS transport failure as unverifiable', async () => {
+    const failingJwksServer = createServer((_req, res) => {
+      res.destroy();
+    });
+    await new Promise<void>((resolve) => {
+      failingJwksServer.listen(0, '127.0.0.1', () => resolve());
+    });
+    const failingAddress = failingJwksServer.address();
+    const failingPort =
+      typeof failingAddress === 'object' && failingAddress ? failingAddress.port : 0;
+    const failingIssuer = `http://127.0.0.1:${failingPort}`;
+    const originalIssuer = process.env.CLERK_JWT_ISSUER_DOMAIN;
+
+    try {
+      process.env.CLERK_JWT_ISSUER_DOMAIN = failingIssuer;
+      const failingModule = await import(`../server/auth-session.ts?jwks-failure=${Date.now()}`);
+      const token = await new SignJWT({ sub: 'user_jwks_failure', plan: 'pro' })
+        .setProtectedHeader({ alg: 'RS256', kid: 'test-key-1' })
+        .setIssuer(failingIssuer)
+        .setAudience('convex')
+        .setSubject('user_jwks_failure')
+        .setIssuedAt()
+        .setExpirationTime('1h')
+        .sign(privateKey);
+
+      assert.deepEqual(
+        await failingModule.validateBearerToken(token),
+        { valid: false, reason: 'unverifiable' },
+      );
+    } finally {
+      process.env.CLERK_JWT_ISSUER_DOMAIN = originalIssuer;
+      await new Promise<void>((resolve, reject) => {
+        failingJwksServer.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
   });
 
   it('reuses the JWKS resolver across calls (not per-request)', async () => {

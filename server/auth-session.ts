@@ -18,6 +18,19 @@ const CLERK_JWT_ISSUER_DOMAIN = process.env.CLERK_JWT_ISSUER_DOMAIN ?? '';
 // does not include a `plan` claim (i.e. standard session token, no template).
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY ?? '';
 
+// Absorb minor issuer/edge clock skew without turning expiration into a broad
+// grace period. This accepts `exp` up to five seconds late (and `nbf` up to five
+// seconds early), widening the corresponding replay window by the same bound.
+const CLERK_JWT_CLOCK_TOLERANCE_SECONDS = 5;
+
+function getClerkJwtVerifyBaseOptions() {
+  return {
+    issuer: CLERK_JWT_ISSUER_DOMAIN,
+    algorithms: ['RS256'],
+    clockTolerance: CLERK_JWT_CLOCK_TOLERANCE_SECONDS,
+  };
+}
+
 // Module-scope JWKS resolver -- cached across warm invocations.
 // jose handles key rotation and caching internally.
 // Exported so server/_shared/auth-session.ts can reuse the same singleton
@@ -101,9 +114,8 @@ function getAllowedAudiences(): string[] {
 
 export function getClerkJwtVerifyOptions() {
   return {
-    issuer: CLERK_JWT_ISSUER_DOMAIN,
+    ...getClerkJwtVerifyBaseOptions(),
     audience: getAllowedAudiences(),
-    algorithms: ['RS256'],
   };
 }
 
@@ -192,10 +204,7 @@ export async function validateBearerToken(token: string): Promise<SessionResult>
       ({ payload } = await jwtVerify(token, jwks, getClerkJwtVerifyOptions()));
     } catch (audErr) {
       if ((audErr as Error).message?.includes('missing required "aud"')) {
-        ({ payload } = await jwtVerify(token, jwks, {
-          issuer: CLERK_JWT_ISSUER_DOMAIN,
-          algorithms: ['RS256'],
-        }));
+        ({ payload } = await jwtVerify(token, jwks, getClerkJwtVerifyBaseOptions()));
       } else {
         throw audErr;
       }
