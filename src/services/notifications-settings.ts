@@ -601,6 +601,8 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
       // Last web-push state actually rendered, so the permission watchers below
       // only re-render when it really changed.
       let renderedWebPushState: WebPushSettingsState | null = null;
+      let requestedWebPushState: WebPushSettingsState | null = null;
+      let notifReloadGeneration = 0;
 
       // Fire-and-forget settings writes MUST NOT surface as unhandled promise
       // rejections. A debounced auto-save that 401s (expired Clerk session) or
@@ -615,6 +617,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
       }
 
       function reloadNotifSection(): void {
+        const generation = ++notifReloadGeneration;
         const loadingEl = container.querySelector<HTMLElement>('#usNotifLoading');
         const contentEl = container.querySelector<HTMLElement>('#usNotifContent');
         if (!loadingEl || !contentEl) return;
@@ -625,8 +628,9 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
           getChannelsData(undefined, signal),
           readWebPushSettingsState(),
         ]).then(([data, webPushState]) => {
-          if (signal.aborted) return;
+          if (signal.aborted || generation !== notifReloadGeneration) return;
           renderedWebPushState = webPushState;
+          requestedWebPushState = null;
           setTrustedHtml(contentEl, trustedHtml(renderNotifContent(data, webPushState), "legacy direct innerHTML migration"));
           loadingEl.style.display = 'none';
           contentEl.style.display = 'block';
@@ -677,7 +681,8 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             },
           });
         }).catch((err) => {
-          if (signal.aborted) return;
+          if (signal.aborted || generation !== notifReloadGeneration) return;
+          requestedWebPushState = null;
           console.error('[notifications] Failed to load settings:', err);
           if (loadingEl) loadingEl.textContent = 'Failed to load notification settings.';
         });
@@ -759,10 +764,14 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         if (signal.aborted) return;
         void readWebPushSettingsState().then((state) => {
           if (signal.aborted) return;
-          if (renderedWebPushState === null || state === renderedWebPushState) return;
-          // Claim the new state before the async reload lands so the permission
-          // listener and the focus fallback firing together only re-render once.
-          renderedWebPushState = state;
+          if (
+            renderedWebPushState === null
+            || state === renderedWebPushState
+            || state === requestedWebPushState
+          ) return;
+          // Coalesce the permission listener and focus fallback without
+          // claiming the state as rendered until the reload actually wins.
+          requestedWebPushState = state;
           reloadNotifSection();
         });
       }

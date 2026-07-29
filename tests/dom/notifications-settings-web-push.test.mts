@@ -322,6 +322,70 @@ describe('notification Settings browser push', () => {
     expect(webPushRow(container).querySelector('#usConnectWebPush')).not.toBeNull();
   });
 
+  it('ignores an older reload that resolves after a newer channel state', async () => {
+    pushState.permission = 'granted';
+    const initialData: ChannelsData = {
+      channels: [
+        ...CONNECTED_WEB_PUSH.channels,
+        { channelType: 'email', verified: true, linkedAt: 1, email: 'a@b.test' },
+      ],
+      alertRules: [],
+    };
+    const container = await mount(initialData);
+
+    let resolveOlderReload: ((data: ChannelsData) => void) | undefined;
+    channelMocks.getChannelsData
+      .mockImplementationOnce(
+        () => new Promise<ChannelsData>((resolve) => { resolveOlderReload = resolve; }),
+      )
+      .mockResolvedValueOnce(EMPTY_DATA);
+
+    pushState.permission = 'denied';
+    window.dispatchEvent(new Event('focus'));
+    await vi.waitFor(() => {
+      expect(resolveOlderReload).toBeDefined();
+    });
+
+    container
+      .querySelector<HTMLElement>('.us-notif-disconnect[data-channel="email"]')!
+      .click();
+    await vi.waitFor(() => {
+      expect(channelMocks.getChannelsData).toHaveBeenCalledTimes(3);
+      expect(webPushRow(container).classList.contains('us-notif-ch-on')).toBe(false);
+    });
+
+    resolveOlderReload!(CONNECTED_WEB_PUSH);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(webPushRow(container).classList.contains('us-notif-ch-on')).toBe(false);
+    expect(webPushRow(container).dataset.webPushState).toBe('denied');
+  });
+
+  it('retries permission recovery after a reload failure', async () => {
+    pushState.permission = 'denied';
+    const container = await mount();
+    channelMocks.getChannelsData
+      .mockRejectedValueOnce(new Error('temporary channels failure'))
+      .mockResolvedValueOnce(EMPTY_DATA);
+
+    pushState.permission = 'granted';
+    window.dispatchEvent(new Event('focus'));
+    await vi.waitFor(() => {
+      expect(channelMocks.getChannelsData).toHaveBeenCalledTimes(2);
+      expect(container.querySelector('#usNotifLoading')?.textContent).toBe(
+        'Failed to load notification settings.',
+      );
+    });
+
+    window.dispatchEvent(new Event('focus'));
+    await vi.waitFor(() => {
+      expect(channelMocks.getChannelsData).toHaveBeenCalledTimes(3);
+      expect(webPushRow(container).dataset.webPushState).toBe('available');
+    });
+    expect(webPushRow(container).querySelector('#usConnectWebPush')).not.toBeNull();
+  });
+
   it('shows unsupported guidance when support disappears during the subscribe', async () => {
     const container = await mount();
     pushState.subscribeToPush.mockImplementation(async () => {
