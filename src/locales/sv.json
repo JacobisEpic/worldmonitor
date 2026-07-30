@@ -1871,7 +1871,11 @@
       "infoTooltip": "<strong>Katastrofkaskad</strong> Detekterar konvergerande signaler för naturkatastrofer och infrastruktur:<ul><li>Korrelerar jordbävningar, skogsbränder, översvämningar och extremt väder</li><li>Spårar kaskadeffekter på infrastruktur och försörjningskedjor</li><li>Markerar regioner med sammanlagd katastrofrisk</li></ul>Klicka på ett kort för att zooma in på den påverkade regionen."
     },
     "markets": {
-      "infoTooltip": "<strong>Marknader</strong> Realtids aktieindex, aktier och kryptovalutapriser. Anpassa din övervakningslista med knappen Övervakningslista. Sparklines visar den senaste pristrenden."
+      "infoTooltip": "<strong>Marknader</strong> Realtids aktieindex, aktier och kryptovalutapriser. Anpassa din övervakningslista med knappen Övervakningslista. Sparklines visar den senaste pristrenden.",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>Sektorkarta</strong> S&P 500-sektorprestanda i en överblick. Färgintensitet återspeglar storleken på den dagliga förändringen. Grön = vinster, Röd = förluster."
@@ -1991,9 +1995,10 @@
           "summaryVerified": "Upplåst och redo när du är det.",
           "channelsNote": "Föredrar du Telegram, Slack, Discord eller en webhook?",
           "pointers": {
+            "search": "Sök i hela instrumentpanelen",
             "widgets": "Skapa en anpassad widget",
             "analyst": "Fråga AI-analytikern",
-            "apiKeys": "Hämta dina API- och MCP-nycklar",
+            "mcpClients": "Konfigurera MCP",
             "channels": "Ställ in dem i aviseringsinställningarna"
           }
         }
@@ -2238,6 +2243,22 @@
         "compactHours": "{{count}}h",
         "compactDays": "{{count}}d"
       }
+    },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
     }
   },
   "popups": {
@@ -3106,12 +3127,15 @@
     "china": {
       "title": "Landsöversikt Kina",
       "description": "Aktuell makro-, marknads-, handels-, energi- och driftstillgänglighet från befintliga publika datakontrakt.",
-      "macroPolicy": "Makro & politik",
-      "marketCredit": "Marknad & kredit",
-      "tradeSupply": "Handel & leveranskedja",
+      "policyEvents": "Policy & Enforcement",
       "energy": "Energi",
       "availability": "Faror & luftfart",
       "observed": "Per:",
+      "published": "Published:",
+      "effective": "Effective:",
+      "sectors": "Sectors:",
+      "entities": "Entities:",
+      "translation": "Translation:",
       "source": "Källa:",
       "imfGrowth": "IMF:s tillväxtprognos",
       "creditGdp": "Kredit i förhållande till BNP",
@@ -3120,8 +3144,6 @@
       "gasDemand": "Gasefterfrågan",
       "energyMix": "Elmix",
       "coal": "kol",
-      "aviationAvailability": "Luftfartstillgänglighet",
-      "hazardAvailability": "Farotillgänglighet",
       "noMajorDisruptions": "Inga större störningar rapporterade",
       "activeDisruptions_one": "{{count}} aktiv störning",
       "activeDisruptions_other": "{{count}} aktiva störningar",
@@ -3133,18 +3155,21 @@
       "ccfiSource": "Shanghai Shipping Exchange",
       "comtradeSource": "UN Comtrade, rapportör 156",
       "sourceUnavailable": "Källa saknas",
-      "macroUnavailable": "Makro- och politikdata är för närvarande inte tillgängliga.",
-      "marketUnavailable": "Marknads- och kreditdata är för närvarande inte tillgängliga.",
-      "tradeUnavailable": "Handels- och leveranskedjedata är för närvarande inte tillgängliga.",
-      "energyUnavailable": "Energidata är för närvarande inte tillgängliga.",
-      "availabilityUnavailable": "Data om faror och luftfart är för närvarande inte tillgängliga.",
+      "policyUnavailable": "Official policy and enforcement events are currently unavailable.",
+      "policyPartial": "{{count}} official agencies are temporarily degraded.",
       "status": {
         "loading": "Läser in",
         "available": "Tillgänglig",
         "partial": "Delvis",
         "stale": "Inaktuell",
         "unavailable": "Otillgänglig"
-      }
+      },
+      "macroSignals": "Macro Signals",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable."
     }
   },
   "preferences": {

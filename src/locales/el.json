@@ -134,12 +134,15 @@
     "china": {
       "title": "Επισκόπηση χώρας: Κίνα",
       "description": "Τρέχουσα εικόνα μακροοικονομίας, αγοράς, εμπορίου, ενέργειας και επιχειρησιακής διαθεσιμότητας από τα υφιστάμενα δημόσια συμβόλαια δεδομένων.",
-      "macroPolicy": "Μακροοικονομία & Πολιτική",
-      "marketCredit": "Αγορά & Πίστωση",
-      "tradeSupply": "Εμπόριο & Εφοδιαστική αλυσίδα",
+      "policyEvents": "Policy & Enforcement",
       "energy": "Ενέργεια",
       "availability": "Κίνδυνοι & Αεροπορία",
       "observed": "Έως:",
+      "published": "Published:",
+      "effective": "Effective:",
+      "sectors": "Sectors:",
+      "entities": "Entities:",
+      "translation": "Translation:",
       "source": "Πηγή:",
       "imfGrowth": "Πρόβλεψη ανάπτυξης ΔΝΤ",
       "creditGdp": "Πίστωση προς ΑΕΠ",
@@ -148,8 +151,6 @@
       "gasDemand": "Ζήτηση φυσικού αερίου",
       "energyMix": "Μείγμα ηλεκτροπαραγωγής",
       "coal": "άνθρακας",
-      "aviationAvailability": "Διαθεσιμότητα αεροπορίας",
-      "hazardAvailability": "Διαθεσιμότητα κινδύνων",
       "noMajorDisruptions": "Δεν αναφέρθηκαν σημαντικές διαταραχές",
       "activeDisruptions_one": "{{count}} ενεργή διαταραχή",
       "activeDisruptions_other": "{{count}} ενεργές διαταραχές",
@@ -161,18 +162,21 @@
       "ccfiSource": "Ναυτιλιακό Χρηματιστήριο της Σαγκάης",
       "comtradeSource": "UN Comtrade, δηλούσα χώρα 156",
       "sourceUnavailable": "Μη διαθέσιμη πηγή",
-      "macroUnavailable": "Τα δεδομένα μακροοικονομίας και πολιτικής δεν είναι διαθέσιμα αυτήν τη στιγμή.",
-      "marketUnavailable": "Τα δεδομένα αγοράς και πίστωσης δεν είναι διαθέσιμα αυτήν τη στιγμή.",
-      "tradeUnavailable": "Τα δεδομένα εμπορίου και εφοδιαστικής αλυσίδας δεν είναι διαθέσιμα αυτήν τη στιγμή.",
-      "energyUnavailable": "Τα ενεργειακά δεδομένα δεν είναι διαθέσιμα αυτήν τη στιγμή.",
-      "availabilityUnavailable": "Τα δεδομένα διαθεσιμότητας κινδύνων και αεροπορίας δεν είναι διαθέσιμα αυτήν τη στιγμή.",
+      "policyUnavailable": "Official policy and enforcement events are currently unavailable.",
+      "policyPartial": "{{count}} official agencies are temporarily degraded.",
       "status": {
         "loading": "Φόρτωση",
         "available": "Διαθέσιμο",
         "partial": "Μερικό",
         "stale": "Παρωχημένο",
         "unavailable": "Μη διαθέσιμο"
-      }
+      },
+      "macroSignals": "Macro Signals",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable."
     }
   },
   "header": {
@@ -2127,7 +2131,11 @@
       "infoTooltip": "<strong>Disaster Cascade</strong> Ανιχνεύει συγκλίνοντα σήματα φυσικής καταστροφής και υποδομής:<ul><li>Συσχετίζει σεισμούς, δασικές πυρκαγιές, πλημμύρες και ακραία καιρικά φαινόμενα</li><li>Παρακολουθεί κασκαδικές επιπτώσεις στην υποδομή και την αλυσίδα εφοδιασμού</li><li>Επισημαίνει περιοχές με σύνθετο κίνδυνο καταστροφής</li></ul>Κάντε κλικ σε μια κάρτα για μεγέθυνση στην πληγείσα περιοχή."
     },
     "markets": {
-      "infoTooltip": "<strong>Markets</strong> Δείκτες αγοράς σε πραγματικό χρόνο, μετοχές και τιμές κρυπτογράφησης. Προσαρμόστε τη λίστα παρακολούθησής σας με το κουμπί Watchlist. Τα sparklines δείχνουν την πρόσφατη τάση τιμής."
+      "infoTooltip": "<strong>Markets</strong> Δείκτες αγοράς σε πραγματικό χρόνο, μετοχές και τιμές κρυπτογράφησης. Προσαρμόστε τη λίστα παρακολούθησής σας με το κουμπί Watchlist. Τα sparklines δείχνουν την πρόσφατη τάση τιμής.",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>Sector Heatmap</strong> Απόδοση του τομέα S&P 500 με μια ματιά. Η ένταση χρώματος αντανακλά το μέγεθος της ημερήσιας αλλαγής. Πράσινο = κέρδη, Κόκκινο = ζημιές."
@@ -2247,9 +2255,10 @@
           "summaryVerified": "Ξεκλειδωμένο και έτοιμο όποτε είστε κι εσείς.",
           "channelsNote": "Προτιμάτε Telegram, Slack, Discord ή ένα webhook;",
           "pointers": {
+            "search": "Αναζήτηση σε ολόκληρο τον πίνακα",
             "widgets": "Δημιουργία προσαρμοσμένου widget",
             "analyst": "Ρωτήστε τον αναλυτή AI",
-            "apiKeys": "Λάβετε τα κλειδιά API & MCP σας",
+            "mcpClients": "Ρύθμιση MCP",
             "channels": "Ρυθμίστε τα στις ρυθμίσεις ειδοποιήσεων"
           }
         }
@@ -2494,6 +2503,22 @@
         "compactHours": "{{count}}h",
         "compactDays": "{{count}}d"
       }
+    },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
     }
   },
   "popups": {

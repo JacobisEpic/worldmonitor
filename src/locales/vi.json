@@ -134,12 +134,15 @@
     "china": {
       "title": "Tổng quan quốc gia: Trung Quốc",
       "description": "Tình hình hiện tại về vĩ mô, thị trường, thương mại, năng lượng và mức sẵn sàng vận hành từ các hợp đồng dữ liệu công khai hiện có.",
-      "macroPolicy": "Vĩ mô & Chính sách",
-      "marketCredit": "Thị trường & Tín dụng",
-      "tradeSupply": "Thương mại & Chuỗi cung ứng",
+      "policyEvents": "Policy & Enforcement",
       "energy": "Năng lượng",
       "availability": "Hiểm họa & Hàng không",
       "observed": "Tính đến:",
+      "published": "Published:",
+      "effective": "Effective:",
+      "sectors": "Sectors:",
+      "entities": "Entities:",
+      "translation": "Translation:",
       "source": "Nguồn:",
       "imfGrowth": "Dự báo tăng trưởng của IMF",
       "creditGdp": "Tín dụng trên GDP",
@@ -148,8 +151,6 @@
       "gasDemand": "Nhu cầu khí đốt",
       "energyMix": "Cơ cấu nguồn điện",
       "coal": "than đá",
-      "aviationAvailability": "Mức sẵn sàng hàng không",
-      "hazardAvailability": "Mức sẵn sàng dữ liệu hiểm họa",
       "noMajorDisruptions": "Không có gián đoạn lớn nào được báo cáo",
       "activeDisruptions_one": "{{count}} gián đoạn đang hoạt động",
       "activeDisruptions_other": "{{count}} gián đoạn đang hoạt động",
@@ -161,18 +162,21 @@
       "ccfiSource": "Sàn giao dịch vận tải biển Thượng Hải",
       "comtradeSource": "UN Comtrade, bên báo cáo 156",
       "sourceUnavailable": "Không có nguồn",
-      "macroUnavailable": "Dữ liệu vĩ mô và chính sách hiện không khả dụng.",
-      "marketUnavailable": "Dữ liệu thị trường và tín dụng hiện không khả dụng.",
-      "tradeUnavailable": "Dữ liệu thương mại và chuỗi cung ứng hiện không khả dụng.",
-      "energyUnavailable": "Dữ liệu năng lượng hiện không khả dụng.",
-      "availabilityUnavailable": "Dữ liệu về hiểm họa và hàng không hiện không khả dụng.",
+      "policyUnavailable": "Official policy and enforcement events are currently unavailable.",
+      "policyPartial": "{{count}} official agencies are temporarily degraded.",
       "status": {
         "loading": "Đang tải",
         "available": "Khả dụng",
         "partial": "Một phần",
         "stale": "Cũ",
         "unavailable": "Không khả dụng"
-      }
+      },
+      "macroSignals": "Macro Signals",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable."
     }
   },
   "header": {
@@ -2127,7 +2131,11 @@
       "infoTooltip": "<strong>Hiệu ứng xếp tầng thảm họa</strong> Phát hiện các tín hiệu thảm họa tự nhiên và cơ sở hạ tầng hội tụ:<ul><li>Tương quan giữa động đất, cháy rừng, lũ lụt và thời tiết khắc nghiệt</li><li>Theo dõi các ảnh hưởng xếp tầng đến cơ sở hạ tầng và chuỗi cung ứng</li><li>Làm nổi bật các khu vực có rủi ro thảm họa kết hợp</li></ul>Nhấp vào một thẻ để phóng to khu vực bị ảnh hưởng."
     },
     "markets": {
-      "infoTooltip": "<strong>Thị trường</strong> Chỉ số chứng khoán, cổ phiếu và giá tiền điện tử thời gian thực. Tùy chỉnh danh sách theo dõi của bạn bằng nút Danh sách theo dõi. Đường sparkline hiển thị xu hướng giá gần đây."
+      "infoTooltip": "<strong>Thị trường</strong> Chỉ số chứng khoán, cổ phiếu và giá tiền điện tử thời gian thực. Tùy chỉnh danh sách theo dõi của bạn bằng nút Danh sách theo dõi. Đường sparkline hiển thị xu hướng giá gần đây.",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>Bản đồ nhiệt ngành</strong> Hiệu suất ngành S&P 500 một cách nhanh chóng. Cường độ màu phản ánh độ lớn của thay đổi hàng ngày. Xanh = lợi nhuận, Đỏ = thua lỗ."
@@ -2247,9 +2255,10 @@
           "summaryVerified": "Đã mở khóa và sẵn sàng khi bạn sẵn sàng.",
           "channelsNote": "Bạn thích Telegram, Slack, Discord hay webhook hơn?",
           "pointers": {
+            "search": "Tìm kiếm toàn bộ bảng điều khiển",
             "widgets": "Tạo widget tùy chỉnh",
             "analyst": "Hỏi nhà phân tích AI",
-            "apiKeys": "Lấy khóa API và MCP của bạn",
+            "mcpClients": "Thiết lập MCP",
             "channels": "Thiết lập chúng trong cài đặt thông báo"
           }
         }
@@ -2494,6 +2503,22 @@
         "compactHours": "{{count}}g",
         "compactDays": "{{count}}n"
       }
+    },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
     }
   },
   "popups": {

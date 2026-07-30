@@ -134,12 +134,15 @@
     "china": {
       "title": "Ülke özeti: Çin",
       "description": "Mevcut kamu veri sözleşmelerinden güncel makro, piyasa, ticaret, enerji ve operasyonel kullanılabilirlik.",
-      "macroPolicy": "Makro ve Politika",
-      "marketCredit": "Piyasa ve Kredi",
-      "tradeSupply": "Ticaret ve Tedarik Zinciri",
+      "policyEvents": "Policy & Enforcement",
       "energy": "Enerji",
       "availability": "Tehlikeler ve Havacılık",
       "observed": "Tarih:",
+      "published": "Published:",
+      "effective": "Effective:",
+      "sectors": "Sectors:",
+      "entities": "Entities:",
+      "translation": "Translation:",
       "source": "Kaynak:",
       "imfGrowth": "IMF büyüme tahmini",
       "creditGdp": "GSYH'ye oranla kredi",
@@ -148,8 +151,6 @@
       "gasDemand": "Gaz talebi",
       "energyMix": "Elektrik karması",
       "coal": "kömür",
-      "aviationAvailability": "Havacılık kullanılabilirliği",
-      "hazardAvailability": "Tehlike kullanılabilirliği",
       "noMajorDisruptions": "Büyük bir kesinti bildirilmedi",
       "activeDisruptions_one": "{{count}} etkin kesinti",
       "activeDisruptions_other": "{{count}} etkin kesinti",
@@ -161,18 +162,21 @@
       "ccfiSource": "Şanghay Denizcilik Borsası",
       "comtradeSource": "UN Comtrade, raporlayan 156",
       "sourceUnavailable": "Kaynak yok",
-      "macroUnavailable": "Makro ve politika verileri şu anda kullanılamıyor.",
-      "marketUnavailable": "Piyasa ve kredi verileri şu anda kullanılamıyor.",
-      "tradeUnavailable": "Ticaret ve tedarik zinciri verileri şu anda kullanılamıyor.",
-      "energyUnavailable": "Enerji verileri şu anda kullanılamıyor.",
-      "availabilityUnavailable": "Tehlike ve havacılık kullanılabilirlik verileri şu anda kullanılamıyor.",
+      "policyUnavailable": "Official policy and enforcement events are currently unavailable.",
+      "policyPartial": "{{count}} official agencies are temporarily degraded.",
       "status": {
         "loading": "Yükleniyor",
         "available": "Kullanılabilir",
         "partial": "Kısmi",
         "stale": "Güncel değil",
         "unavailable": "Kullanılamıyor"
-      }
+      },
+      "macroSignals": "Macro Signals",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable."
     }
   },
   "header": {
@@ -2127,7 +2131,11 @@
       "infoTooltip": "<strong>Felaket Kaskadı</strong> Yakınlaşan doğal afet ve altyapı sinyallerini tespit eder:<ul><li>Depremleri, orman yangınlarını, seller ve hava aşırılıklarını ilişkilendirir</li><li>Altyapı ve tedarik zincirlerine ilişkin basamaklı etkileri izler</li><li>Bileşik afet riski olan bölgeleri vurgular</li></ul>Etkilenen bölgeyi haritada yakınlaştırmak için bir kartı tıklayın."
     },
     "markets": {
-      "infoTooltip": "<strong>Piyasalar</strong> Gerçek zamanlı borsa endeksleri, hisse senetleri ve kripto fiyatları. Watchlist düğmesi ile izleme listenizi özelleştirin. Sparkline'lar son fiyat eğilimini gösterir."
+      "infoTooltip": "<strong>Piyasalar</strong> Gerçek zamanlı borsa endeksleri, hisse senetleri ve kripto fiyatları. Watchlist düğmesi ile izleme listenizi özelleştirin. Sparkline'lar son fiyat eğilimini gösterir.",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>Sektör Isı Haritası</strong> S&P 500 sektör performansını bir bakışta görün. Renk yoğunluğu günlük değişimin büyüklüğünü yansıtır. Yeşil = kazançlar, Kırmızı = kayıplar."
@@ -2247,9 +2255,10 @@
           "summaryVerified": "Kilidi açıldı, siz hazır olduğunuzda kullanıma hazır.",
           "channelsNote": "Telegram, Slack, Discord veya bir webhook mu tercih edersiniz?",
           "pointers": {
+            "search": "Tüm panoda ara",
             "widgets": "Özel bir widget oluşturun",
             "analyst": "Yapay zeka analistine sorun",
-            "apiKeys": "API ve MCP anahtarlarınızı alın",
+            "mcpClients": "MCP'yi kurun",
             "channels": "Bunları bildirim ayarlarından yapılandırın"
           }
         }
@@ -2494,6 +2503,22 @@
         "compactHours": "{{count}}h",
         "compactDays": "{{count}}d"
       }
+    },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
     }
   },
   "popups": {

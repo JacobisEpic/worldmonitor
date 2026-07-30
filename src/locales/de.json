@@ -134,12 +134,15 @@
     "china": {
       "title": "China-Länderüberblick",
       "description": "Aktuelle Makro-, Markt-, Handels-, Energie- und Betriebsverfügbarkeitsdaten aus bestehenden öffentlichen Datenverträgen.",
-      "macroPolicy": "Makro & Politik",
-      "marketCredit": "Markt & Kredit",
-      "tradeSupply": "Handel & Lieferkette",
+      "policyEvents": "Policy & Enforcement",
       "energy": "Energie",
       "availability": "Gefahren & Luftfahrt",
       "observed": "Stand:",
+      "published": "Published:",
+      "effective": "Effective:",
+      "sectors": "Sectors:",
+      "entities": "Entities:",
+      "translation": "Translation:",
       "source": "Quelle:",
       "imfGrowth": "IWF-Wachstumsprognose",
       "creditGdp": "Kredit im Verhältnis zum BIP",
@@ -148,8 +151,6 @@
       "gasDemand": "Gasnachfrage",
       "energyMix": "Strommix",
       "coal": "Kohle",
-      "aviationAvailability": "Luftfahrt-Verfügbarkeit",
-      "hazardAvailability": "Gefahren-Verfügbarkeit",
       "noMajorDisruptions": "Keine größeren Störungen gemeldet",
       "activeDisruptions_one": "{{count}} aktive Störung",
       "activeDisruptions_other": "{{count}} aktive Störungen",
@@ -161,18 +162,21 @@
       "ccfiSource": "Shanghai Shipping Exchange",
       "comtradeSource": "UN Comtrade, Berichtsland 156",
       "sourceUnavailable": "Quelle nicht verfügbar",
-      "macroUnavailable": "Makro- und Politikdaten sind derzeit nicht verfügbar.",
-      "marketUnavailable": "Markt- und Kreditdaten sind derzeit nicht verfügbar.",
-      "tradeUnavailable": "Handels- und Lieferkettendaten sind derzeit nicht verfügbar.",
-      "energyUnavailable": "Energiedaten sind derzeit nicht verfügbar.",
-      "availabilityUnavailable": "Gefahren- und Luftfahrtdaten sind derzeit nicht verfügbar.",
+      "policyUnavailable": "Official policy and enforcement events are currently unavailable.",
+      "policyPartial": "{{count}} official agencies are temporarily degraded.",
       "status": {
         "loading": "Wird geladen",
         "available": "Verfügbar",
         "partial": "Teilweise",
         "stale": "Veraltet",
         "unavailable": "Nicht verfügbar"
-      }
+      },
+      "macroSignals": "Macro Signals",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable."
     }
   },
   "header": {
@@ -1478,7 +1482,7 @@
       }
     },
     "gdeltIntel": {
-      "infoTooltip": "<strong>News Intelligence</strong> Globale Nachrichtenüberwachung in Echtzeit:<ul><li>Kuratierte Themenkategorien (Konflikte, Cyber ​​usw.)</li><li>Artikel aus über 100 Sprachen übersetzt</li><li>Aktualisierungen alle 15 Minuten</li><li>14-day media tone &amp; volume trend per topic</li></ul>Quelle: GDELT-Projekt (gdeltproject.org)"
+      "infoTooltip": "<strong>News Intelligence</strong> Globale Nachrichtenüberwachung in Echtzeit:<ul><li>Kuratierte Themenkategorien (Konflikte, Cyber usw.)</li><li>Artikel aus über 100 Sprachen übersetzt</li><li>Aktualisierungen alle 15 Minuten</li><li>14-day media tone &amp; volume trend per topic</li></ul>Quelle: GDELT-Projekt (gdeltproject.org)"
     },
     "telegramIntel": {
       "infoTooltip": "Echtzeit-Signale aus überwachten Telegram-OSINT-Kanälen",
@@ -2127,7 +2131,11 @@
       "infoTooltip": "<strong>Katastrophen-Kaskadeneffekte</strong> Erkennt konvergierende Signale natürlicher Katastrophen und Infrastruktur:<ul><li>Korreliert Erdbeben, Waldbrände, Überschwemmungen und Wetterextreme</li><li>Verfolgt kaskadierende Effekte auf Infrastruktur und Lieferketten</li><li>Hebt Regionen mit zusammengesetztem Katastrophenrisiko hervor</li></ul>Klicken Sie auf eine Karte, um die betroffene Region zu vergrößern."
     },
     "markets": {
-      "infoTooltip": "<strong>Märkte</strong> Echtzeit-Börsenindizes, Aktien und Kryptowährungspreise. Passen Sie Ihre Beobachtungsliste mit der Schaltfläche Beobachtungsliste an. Sparklines zeigen aktuelle Preistrendentwicklung."
+      "infoTooltip": "<strong>Märkte</strong> Echtzeit-Börsenindizes, Aktien und Kryptowährungspreise. Passen Sie Ihre Beobachtungsliste mit der Schaltfläche Beobachtungsliste an. Sparklines zeigen aktuelle Preistrendentwicklung.",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>Sektor-Heatmap</strong> S&P 500 Sektorenleistung auf einen Blick. Die Farbintensität spiegelt die Größe der täglichen Veränderung wider. Grün = Gewinne, Rot = Verluste."
@@ -2247,9 +2255,10 @@
           "summaryVerified": "Freigeschaltet und einsatzbereit, wenn Sie es sind.",
           "channelsNote": "Lieber Telegram, Slack, Discord oder ein Webhook?",
           "pointers": {
+            "search": "Das gesamte Dashboard durchsuchen",
             "widgets": "Ein individuelles Widget erstellen",
             "analyst": "Den KI-Analysten fragen",
-            "apiKeys": "Ihre API- & MCP-Schlüssel abrufen",
+            "mcpClients": "MCP einrichten",
             "channels": "In den Benachrichtigungseinstellungen einrichten"
           }
         }
@@ -2494,6 +2503,22 @@
         "compactHours": "{{count}}h",
         "compactDays": "{{count}}d"
       }
+    },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
     }
   },
   "popups": {

@@ -9,6 +9,7 @@ import {
 } from '@/services/billing';
 import {
   getEntitlementState,
+  hasFeature,
   onEntitlementChange,
   type EntitlementState,
 } from '@/services/entitlements';
@@ -141,6 +142,8 @@ export interface ProActivationControllerOptions {
   reloadPending: boolean;
   /** Panel-owned surface opener that cannot be implemented outside the layout. */
   openAiAnalyst: () => void;
+  /** App-owned global command-search opener. */
+  openSearch?: () => void;
 }
 
 type ChipDecision = 'show' | 'wait' | 'hide';
@@ -163,6 +166,8 @@ export class ProActivationController implements AppModule {
   private authStateKey: string | null = null;
   private authGeneration = 0;
   private readonly mountNonce = generateMountClaimNonce();
+  private readonly mountSessionStartedAt = Date.now();
+  private lastDay0SessionStartedAt = this.mountSessionStartedAt;
 
   constructor(
     private readonly ctx: AppContext,
@@ -413,9 +418,16 @@ export class ProActivationController implements AppModule {
     if (decision !== 'show') return;
 
     const flowOptions = this.buildFlowOptions();
-    if (!flowOptions) return;
+    const subscriptionKey = deriveSubscriptionKey(subscription);
+    if (!flowOptions || subscriptionKey === null) return;
     void import('@/components/ProActivationChip')
-      .then((module) => module.maybeShowFinishSetupChip(flowOptions))
+      .then((module) =>
+        module.maybeShowFinishSetupChip({
+          ...flowOptions,
+          onlyIfUnactivated: false,
+          expectedActivationKey: subscriptionKey,
+        }),
+      )
       .catch((error) => console.warn('[pro-activation] finish-setup chip failed to load', error));
   }
 
@@ -546,8 +558,13 @@ export class ProActivationController implements AppModule {
       const result = await module.openProActivationFlow({
         ...flowOptions,
         onlyIfUnactivated,
-        expectedActivationKey: onlyIfUnactivated ? subscriptionKey : undefined,
-        activationClaimNonce: onlyIfUnactivated ? this.mountNonce : undefined,
+        // Both cohorts carry the identity now (#5621). The markerless path uses
+        // it for its cross-device lease; the day-0 path uses it only to attach
+        // outcomes to a server-side row, which is why day-0 previously ran with
+        // these undefined and left its cohort invisible in Convex.
+        expectedActivationKey: subscriptionKey,
+        activationClaimNonce: this.mountNonce,
+        activationSessionStartedAt: this.mountSessionStartedAt,
       });
       // The interstitial may already be rendered by this point (opened
       // synchronously inside openProActivationFlow before it resolves). If
@@ -571,11 +588,36 @@ export class ProActivationController implements AppModule {
     return {
       accountUserId: user.id,
       accountEmail: user.email,
-      openApiKeys: () => ctx.unifiedSettings?.open('api-keys'),
+      createDay0SessionIdentity: () => {
+        const sessionStartedAt = Math.max(Date.now(), this.lastDay0SessionStartedAt + 1);
+        this.lastDay0SessionStartedAt = sessionStartedAt;
+        return {
+          activationClaimNonce: generateMountClaimNonce(),
+          activationSessionStartedAt: sessionStartedAt,
+        };
+      },
+      // Pro entitles MCP, not the API plans' keys (#5607). Gate on the feature
+      // rather than the plan key: UnifiedSettings hides both the MCP tab and its
+      // panel without `mcpAccess`, so deep-linking there would open settings on a
+      // tab that has no panel to show. A Pro row written before the catalog field
+      // existed still resolves true — convex/entitlements.ts read-merges catalog
+      // defaults — so this only fail-closes on an explicit per-user override.
+      // Leaving the opener undefined makes buildPowerExtra drop the pointer.
+      openMcpClients: hasFeature('mcpAccess')
+        ? () => {
+            // Re-check at click time, not just here: the finish-setup chip
+            // replays this captured options object long after it was built, so
+            // an entitlement that lapsed in between would otherwise deep-link
+            // to a tab UnifiedSettings no longer renders.
+            if (hasFeature('mcpAccess')) ctx.unifiedSettings?.open('mcp-clients');
+            else ctx.unifiedSettings?.open('settings');
+          }
+        : undefined,
       openChannelSettings: () => ctx.unifiedSettings?.open('notifications'),
       openWidgetBuilder: () =>
         ctx.container.dispatchEvent(new CustomEvent('wm:open-widget-creator', { detail: {} })),
       openAiAnalyst: this.options.openAiAnalyst,
+      openSearch: this.options.openSearch,
       onEvent: (event, stepId, exit) =>
         trackProActivation(event, {
           planKey: getEntitlementState()?.planKey ?? null,

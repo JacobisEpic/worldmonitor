@@ -720,7 +720,7 @@
         "moderate": "MODERADO",
         "normal": "NORMAL"
       },
-      "infoTooltip": "<strong>Climate Anomaly Monitor</strong> Temperature and precipitation deviations from 30-day baseline. Dados do Open-Meteo (reanálise ERA5).<ul><li><strong>Extremo</strong>: >5°C ou >80mm/dia ​​de desvio</li><li><strong>Moderado</strong>: >3°C ou >40mm/dia ​​de desvio</li></ul>Monitora 15 zonas propensas a conflitos/desastres."
+      "infoTooltip": "<strong>Climate Anomaly Monitor</strong> Temperature and precipitation deviations from 30-day baseline. Dados do Open-Meteo (reanálise ERA5).<ul><li><strong>Extremo</strong>: >5°C ou >80mm/dia de desvio</li><li><strong>Moderado</strong>: >3°C ou >40mm/dia de desvio</li></ul>Monitora 15 zonas propensas a conflitos/desastres."
     },
     "newsPanel": {
       "close": "Fechar",
@@ -1878,7 +1878,11 @@
       "infoTooltip": "<strong>Cascata de Desastres</strong> Detecta sinais convergentes de desastres naturais e infraestrutura:<ul><li>Correlaciona terremotos, incêndios florestais, inundações e extremos climáticos</li><li>Rastreia efeitos cascata em infraestrutura e cadeias de suprimentos</li><li>Destaca regiões com risco de desastre composto</li></ul>Clique em um card para ampliar a região afetada."
     },
     "markets": {
-      "infoTooltip": "<strong>Mercados</strong> Índices em tempo real, ações e preços de criptomoedas. Personalize sua watchlist com o botão Watchlist. Os gráficos de tendência mostram a tendência de preço recente."
+      "infoTooltip": "<strong>Mercados</strong> Índices em tempo real, ações e preços de criptomoedas. Personalize sua watchlist com o botão Watchlist. Os gráficos de tendência mostram a tendência de preço recente.",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>Mapa de Calor de Setores</strong> Desempenho de setores do S&P 500 em um relance. A intensidade da cor reflete a magnitude da mudança diária. Verde = ganhos, Vermelho = perdas."
@@ -1998,9 +2002,10 @@
           "summaryVerified": "Desbloqueado e pronto quando você estiver.",
           "channelsNote": "Prefere Telegram, Slack, Discord ou um webhook?",
           "pointers": {
+            "search": "Pesquisar em todo o painel",
             "widgets": "Criar um widget personalizado",
             "analyst": "Perguntar ao analista de IA",
-            "apiKeys": "Obter suas chaves de API e MCP",
+            "mcpClients": "Configurar MCP",
             "channels": "Configure-os nas configurações de notificação"
           }
         }
@@ -2254,6 +2259,22 @@
         "compactHours": "{{count}}h",
         "compactDays": "{{count}}d"
       }
+    },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
     }
   },
   "popups": {
@@ -3122,12 +3143,15 @@
     "china": {
       "title": "Panorama do país: China",
       "description": "Situação atual de macro, mercado, comércio, energia e disponibilidade operacional a partir dos contratos de dados públicos existentes.",
-      "macroPolicy": "Macro e política",
-      "marketCredit": "Mercado e crédito",
-      "tradeSupply": "Comércio e cadeia de suprimentos",
+      "policyEvents": "Policy & Enforcement",
       "energy": "Energia",
       "availability": "Riscos e aviação",
       "observed": "Em:",
+      "published": "Published:",
+      "effective": "Effective:",
+      "sectors": "Sectors:",
+      "entities": "Entities:",
+      "translation": "Translation:",
       "source": "Fonte:",
       "imfGrowth": "Previsão de crescimento do FMI",
       "creditGdp": "Crédito sobre o PIB",
@@ -3136,8 +3160,6 @@
       "gasDemand": "Demanda de gás",
       "energyMix": "Matriz elétrica",
       "coal": "carvão",
-      "aviationAvailability": "Disponibilidade da aviação",
-      "hazardAvailability": "Disponibilidade de riscos",
       "noMajorDisruptions": "Nenhuma interrupção relevante informada",
       "activeDisruptions_one": "{{count}} interrupção ativa",
       "activeDisruptions_many": "{{count}} interrupções ativas",
@@ -3151,18 +3173,21 @@
       "ccfiSource": "Bolsa de Navegação de Xangai",
       "comtradeSource": "UN Comtrade, declarante 156",
       "sourceUnavailable": "Fonte indisponível",
-      "macroUnavailable": "Os dados macro e de política estão indisponíveis no momento.",
-      "marketUnavailable": "Os dados de mercado e crédito estão indisponíveis no momento.",
-      "tradeUnavailable": "Os dados de comércio e cadeia de suprimentos estão indisponíveis no momento.",
-      "energyUnavailable": "Os dados de energia estão indisponíveis no momento.",
-      "availabilityUnavailable": "Os dados de disponibilidade de riscos e aviação estão indisponíveis no momento.",
+      "policyUnavailable": "Official policy and enforcement events are currently unavailable.",
+      "policyPartial": "{{count}} official agencies are temporarily degraded.",
       "status": {
         "loading": "Carregando",
         "available": "Disponível",
         "partial": "Parcial",
         "stale": "Desatualizado",
         "unavailable": "Indisponível"
-      }
+      },
+      "macroSignals": "Macro Signals",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable."
     }
   },
   "preferences": {

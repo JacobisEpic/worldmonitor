@@ -20,10 +20,11 @@
  * an INJECTED storage handle (so tests stay jsdom-free); every other storage
  * read/write still lives in the panel-layout/UI units.
  *
- * Plan identity is an allowlist against the two Pro product ids. The literals
- * are mirrored from config/products.generated.ts (DODO_PRODUCTS.PRO_MONTHLY /
- * PRO_ANNUAL) rather than imported — keeping the leaf import-free — and
- * tests/pro-activation-state.test.mts asserts them against the generated
+ * Plan identity is an allowlist against the Pro-family product ids. The
+ * literals are mirrored from config/products.generated.ts (DODO_PRODUCTS
+ * PRO_MONTHLY / PRO_ANNUAL / PRO_BUSINESS_*) rather than imported — keeping
+ * the leaf import-free — and tests/pro-activation-state.test.mts asserts
+ * them against the generated
  * catalog so any drift goes red. The repo product-id guard excludes this file
  * for the same reason (the drift-guard test provides the catalog-sync it wants).
  */
@@ -33,20 +34,29 @@
 // ---------------------------------------------------------------------------
 
 /**
- * The only two product ids that grant Pro. Mirrors
- * `DODO_PRODUCTS.PRO_MONTHLY` / `PRO_ANNUAL` (kept in sync by the drift-guard
- * test). Anything else — api_starter, api_starter_annual, api_business,
- * enterprise, or an unknown id — is non-Pro and must never trigger onboarding.
+ * The only product ids that grant Pro. Mirrors `DODO_PRODUCTS.PRO_MONTHLY` /
+ * `PRO_ANNUAL` / `PRO_BUSINESS_MONTHLY` / `PRO_BUSINESS_ANNUAL` (kept in sync
+ * by the drift-guard test). Pro Business is a larger Pro and gets the same
+ * day-0 activation (KTD9). Anything else — api_starter, api_starter_annual,
+ * api_business, enterprise, or an unknown id — is non-Pro and must never
+ * trigger onboarding.
  */
 export const PRO_PRODUCT_IDS: readonly string[] = [
   'pdt_0Nbtt71uObulf7fGXhQup', // PRO_MONTHLY
   'pdt_0NbttMIfjLWC10jHQWYgJ', // PRO_ANNUAL
+  'pdt_0NjyFDbhURh2oROgPIU3G', // PRO_BUSINESS_MONTHLY
+  'pdt_0Nk072fxPUcHWivZRtlQW', // PRO_BUSINESS_ANNUAL
 ];
 
 /** The entitlement plan keys that classify as Pro (productCatalog.ts). */
-export const PRO_PLAN_KEYS: readonly string[] = ['pro_monthly', 'pro_annual'];
+export const PRO_PLAN_KEYS: readonly string[] = [
+  'pro_monthly',
+  'pro_annual',
+  'pro_business_monthly',
+  'pro_business_annual',
+];
 
-/** True when `productId` is one of the two Pro products. */
+/** True when `productId` is one of the Pro-family products. */
 export function isProProductId(productId: string): boolean {
   return PRO_PRODUCT_IDS.includes(productId);
 }
@@ -665,8 +675,18 @@ export function buildCriticalAlertsPayload(
 // Exit summary + finish-setup chip
 // ---------------------------------------------------------------------------
 
-/** What actually happened to a step during the flow. */
-export type ActivationStepOutcome = 'confirmed' | 'skipped' | 'done' | 'failed';
+/**
+ * What actually happened to a step during the flow.
+ *
+ * `blocked` is deliberately distinct from `skipped` (#5617). Both keep the
+ * aggregate `pending` status, but `blocked` says the BROWSER refused and lets
+ * the UI render browser-specific recovery guidance (#5727). Collapsing the two
+ * makes the push-permission-denial cohort unsizeable after the fact, and makes
+ * "is re-prompting this account worth anything?" unanswerable (it never is,
+ * once permission is `denied`). It is equally not `failed`: we never attempted
+ * a write, so "we couldn't set this up" would be a false claim.
+ */
+export type ActivationStepOutcome = 'confirmed' | 'skipped' | 'blocked' | 'done' | 'failed';
 
 /** R15 line status: distinct verified / pending / failed. */
 export type ActivationSummaryStatus = 'verified' | 'pending' | 'failed';
@@ -688,9 +708,36 @@ function outcomeStatus(outcome: ActivationStepOutcome): ActivationSummaryStatus 
     case 'done':
       return 'verified';
     case 'skipped':
+      // A browser refusal is durably distinct (#5617) but keeps the `pending`
+      // status, NOT `failed`: the summary renders `failed` as "we couldn't set
+      // this up", which claims an attempt we were never allowed to make. Its
+      // detail copy can still explain the browser block (#5727).
+    case 'blocked':
       return 'pending';
     case 'failed':
       return 'failed';
+  }
+}
+
+/**
+ * The outcome a step resolves to when the flow advances past it without a
+ * confirm. The shell reaches this from two directions — the blocked/unavailable
+ * "Continue" button, and the implicit default for a step the user never acted
+ * on (dismiss / Escape) — so it lives here as one pure seam: a denial recorded
+ * through one path and a plain skip through the other would make `blockedSteps`
+ * a biased sample of the exact cohort it exists to size (#5617).
+ */
+export function selectAdvanceOutcome(state: ActivationStepState): ActivationStepOutcome {
+  switch (state) {
+    case 'already-done':
+      return 'done';
+    case 'blocked':
+      return 'blocked';
+    case 'confirmable':
+    // Unavailable is a platform gap, not a browser refusal: nothing was ever
+    // offered or denied, so it stays an ordinary unfinished step.
+    case 'unavailable':
+      return 'skipped';
   }
 }
 
@@ -747,23 +794,49 @@ export function summarizeActivationExit(
 export interface ActivationOutcomeBuckets {
   /** Steps that ended verified -- confirmed in-flow or already-done. */
   readonly confirmedSteps: readonly ActivationStepId[];
+  /** Steps the subscriber chose to leave unfinished. */
   readonly skippedSteps: readonly ActivationStepId[];
+  /**
+   * Steps the BROWSER refused (a denied notification permission). Its own
+   * bucket rather than a widening of `skippedSteps` (#5617), so existing
+   * consumers of the three original buckets keep their exact meaning.
+   */
+  readonly blockedSteps: readonly ActivationStepId[];
+  /** Steps whose write was attempted and failed. */
   readonly failedSteps: readonly ActivationStepId[];
 }
 
-/** Bucket step results by outcome for persistence, independent of the Umami exit event. */
+/**
+ * Bucket step results by outcome for persistence, independent of the Umami exit
+ * event. Every outcome is routed EXPLICITLY: the previous `else` catch-all
+ * would have swallowed the new `blocked` outcome into `failedSteps`, silently
+ * labelling a browser refusal as a failed write.
+ */
 export function buildActivationOutcomeBuckets(
   results: readonly ActivationStepResult[],
 ): ActivationOutcomeBuckets {
   const confirmedSteps: ActivationStepId[] = [];
   const skippedSteps: ActivationStepId[] = [];
+  const blockedSteps: ActivationStepId[] = [];
   const failedSteps: ActivationStepId[] = [];
   for (const r of results) {
-    if (r.outcome === 'confirmed' || r.outcome === 'done') confirmedSteps.push(r.id);
-    else if (r.outcome === 'skipped') skippedSteps.push(r.id);
-    else failedSteps.push(r.id);
+    switch (r.outcome) {
+      case 'confirmed':
+      case 'done':
+        confirmedSteps.push(r.id);
+        break;
+      case 'skipped':
+        skippedSteps.push(r.id);
+        break;
+      case 'blocked':
+        blockedSteps.push(r.id);
+        break;
+      case 'failed':
+        failedSteps.push(r.id);
+        break;
+    }
   }
-  return { confirmedSteps, skippedSteps, failedSteps };
+  return { confirmedSteps, skippedSteps, blockedSteps, failedSteps };
 }
 
 /** Versioned localStorage key for the finish-setup chip dismissal. */
@@ -870,9 +943,11 @@ export function parseChipDismissal(raw: string | null): FinishSetupChipDismissal
 
 /**
  * Whether to surface the persistent "finish setup" chip after the flow. Shows
- * when any step is left unfinished (skipped or failed) and the chip has not
- * been dismissed within its TTL; a fully completed flow (or a fresh dismissal)
- * shows nothing.
+ * when any step is left unfinished (skipped, blocked, or failed) and the chip
+ * has not been dismissed within its TTL; a fully completed flow (or a fresh
+ * dismissal) shows nothing. `blocked` counts as unfinished for the same reason
+ * it reads as `pending`: splitting it out of `skippedSteps` (#5617) changed the
+ * durable record, never what the subscriber sees.
  */
 export function shouldShowFinishSetupChip(
   results: readonly ActivationStepResult[],
@@ -881,7 +956,9 @@ export function shouldShowFinishSetupChip(
   now: number,
 ): boolean {
   if (isChipDismissed(dismissal, currentAccountKey, now)) return false;
-  return results.some((r) => r.outcome === 'skipped' || r.outcome === 'failed');
+  return results.some(
+    (r) => r.outcome === 'skipped' || r.outcome === 'blocked' || r.outcome === 'failed',
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -893,8 +970,77 @@ export const ACTIVATION_EVENTS = {
   entered: 'pro-activation-entered',
   stepConfirmed: 'pro-activation-step-confirmed',
   stepSkipped: 'pro-activation-step-skipped',
+  // A step the platform refused unrecoverably (a denied notification
+  // permission). Without this event the denial cohort would be indistinguishable
+  // on the live stream from users who chose to skip — the funnel would read a
+  // browser block as disinterest. The durable counterpart is the `blocked`
+  // outcome and its own `blockedSteps` bucket (#5617).
+  stepBlocked: 'pro-activation-step-blocked',
+  // #5600: a step whose write genuinely errored. Distinct from `stepBlocked`:
+  // that one is the platform refusing, this one is our write failing. Without
+  // it the only trace of a failure was a `stepSkipped` plus an aggregate count
+  // on the exit event, so a day of broken day-0 activations read as user
+  // disinterest.
+  stepFailed: 'pro-activation-step-failed',
   exit: 'pro-activation-exit',
 } as const;
+
+/**
+ * How an in-flow confirm resolved.
+ *
+ * `blocked` means the platform refused in a way a retry cannot fix — a denied
+ * notification permission, which browsers never re-prompt for (#5609).
+ *
+ * `declined` means the USER walked away from a prompt without deciding (they
+ * dismissed the notification permission dialog, leaving it `default`). A retry
+ * still works, so the UI treats it like `failed`, but the funnel must not: it is
+ * a user outcome, not our write erroring. Folding it into `failed` is what let a
+ * dismissed prompt — the common case for the alerts step — land in the
+ * `pro-activation-step-failed` metric added to catch systemic write failures
+ * (#5600). Note `shouldReportPushSubscribeFailure` already excluded this state
+ * from Sentry for exactly this reason; the funnel just did not agree.
+ */
+export type ActivationConfirmResult = 'verified' | 'failed' | 'blocked' | 'declined';
+
+/**
+ * The step outcome a confirm result reports as, or null when the result is
+ * already reported through another channel.
+ *
+ * `blocked` maps to null on purpose: the shell fires its own `stepBlocked`
+ * event via `onBlockStep`, so emitting a step event here too would count one
+ * attempt twice — re-creating the mislabeled-funnel bug #5600 exists to fix,
+ * just with a different pair of labels.
+ */
+export function selectConfirmOutcome(
+  result: ActivationConfirmResult,
+): ActivationStepOutcome | null {
+  switch (result) {
+    case 'verified':
+      return 'confirmed';
+    case 'failed':
+      return 'failed';
+    case 'blocked':
+      // The shell fires its own stepBlocked via onBlockStep (#5609).
+      return null;
+    case 'declined':
+      // A dismissed prompt is a user choice. The shell reports it as a skip when
+      // the user moves on, so emitting a confirm-time event here would either
+      // double-count it or mislabel it as our failure (#5600).
+      return null;
+  }
+}
+
+/**
+ * Whether a failed `subscribeToPush` is worth reporting to Sentry.
+ *
+ * Only granted-then-failed is a real error. `denied` and `default` (the user
+ * dismissed the prompt without choosing) are both the documented AE3 user
+ * outcome and are the common case — reporting them would bury genuine failures
+ * under permission noise (#5600).
+ */
+export function shouldReportPushSubscribeFailure(permission: string): boolean {
+  return permission === 'granted';
+}
 
 /**
  * The set of activation telemetry event names. This is the single naming
@@ -906,17 +1052,24 @@ export type ActivationEventName = (typeof ACTIVATION_EVENTS)[keyof typeof ACTIVA
 
 /**
  * The per-step telemetry event for an outcome, or null when the outcome is not
- * a tracked user action: `done` (nothing to do, pre-configured) and `failed`
- * (surfaced via the exit summary, not a dedicated step event) both emit none.
+ * a tracked user action: only `done` (nothing to do, pre-configured) emits
+ * none. `failed` has its own event since #5600 — folding it into the exit
+ * summary alone is what let a systemic write failure look like a skip.
+ * `blocked` keeps its OWN event — falling through to `stepSkipped` would
+ * re-collapse the denial cohort into voluntary skips at the event level, the
+ * exact gap the event was added to close (#5609).
  */
-export function selectStepEvent(outcome: ActivationStepOutcome): string | null {
+export function selectStepEvent(outcome: ActivationStepOutcome): ActivationEventName | null {
   switch (outcome) {
     case 'confirmed':
       return ACTIVATION_EVENTS.stepConfirmed;
     case 'skipped':
       return ACTIVATION_EVENTS.stepSkipped;
-    case 'done':
+    case 'blocked':
+      return ACTIVATION_EVENTS.stepBlocked;
     case 'failed':
+      return ACTIVATION_EVENTS.stepFailed;
+    case 'done':
       return null;
   }
 }

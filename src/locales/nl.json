@@ -1871,7 +1871,11 @@
       "infoTooltip": "<strong>Disaster Cascade</strong> Detecteert convergerende natuurramp- en infrastructuursignalen:<ul><li>Correleert aardbevingen, bosbranden, overstromingen en weerextremen</li><li>Volgt cascadische effecten op infrastructuur en toeleveringsketens</li><li>Markeert regio's met samengesteld risicorisico</li></ul>Klik op een kaart om naar de getroffen regio in te zoomen."
     },
     "markets": {
-      "infoTooltip": "<strong>Markten</strong> Real-time aandelenindices, aandelen en cryptoprijzen. Pas uw watchlist aan met de knop Watchlist. Sparklines tonen recente prijstrend."
+      "infoTooltip": "<strong>Markten</strong> Real-time aandelenindices, aandelen en cryptoprijzen. Pas uw watchlist aan met de knop Watchlist. Sparklines tonen recente prijstrend.",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>Sector Heatmap</strong> S&P 500 sectorprestatie in één oogopslag. Kleurintensiteit weerspiegelt de omvang van dagelijkse verandering. Groen = winsten, Rood = verlies."
@@ -1991,9 +1995,10 @@
           "summaryVerified": "Ontgrendeld en klaar wanneer jij dat bent.",
           "channelsNote": "Heb je liever Telegram, Slack, Discord of een webhook?",
           "pointers": {
+            "search": "Het hele dashboard doorzoeken",
             "widgets": "Een aangepaste widget maken",
             "analyst": "Stel de AI-analist een vraag",
-            "apiKeys": "Je API- en MCP-sleutels ophalen",
+            "mcpClients": "MCP instellen",
             "channels": "Stel deze in bij de meldingsinstellingen"
           }
         }
@@ -2238,6 +2243,22 @@
         "compactHours": "{{count}}h",
         "compactDays": "{{count}}d"
       }
+    },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
     }
   },
   "popups": {
@@ -3106,12 +3127,15 @@
     "china": {
       "title": "Landenoverzicht China",
       "description": "Actuele macro-, markt-, handels-, energie- en operationele beschikbaarheid uit bestaande publieke datacontracten.",
-      "macroPolicy": "Macro & beleid",
-      "marketCredit": "Markt & krediet",
-      "tradeSupply": "Handel & toeleveringsketen",
+      "policyEvents": "Policy & Enforcement",
       "energy": "Energie",
       "availability": "Gevaren & luchtvaart",
       "observed": "Per:",
+      "published": "Published:",
+      "effective": "Effective:",
+      "sectors": "Sectors:",
+      "entities": "Entities:",
+      "translation": "Translation:",
       "source": "Bron:",
       "imfGrowth": "IMF-groeiprognose",
       "creditGdp": "Krediet t.o.v. bbp",
@@ -3120,8 +3144,6 @@
       "gasDemand": "Gasvraag",
       "energyMix": "Stroommix",
       "coal": "steenkool",
-      "aviationAvailability": "Beschikbaarheid luchtvaart",
-      "hazardAvailability": "Beschikbaarheid gevaren",
       "noMajorDisruptions": "Geen grote verstoringen gemeld",
       "activeDisruptions_one": "{{count}} actieve verstoring",
       "activeDisruptions_other": "{{count}} actieve verstoringen",
@@ -3133,18 +3155,21 @@
       "ccfiSource": "Shanghai Shipping Exchange",
       "comtradeSource": "UN Comtrade, rapporteur 156",
       "sourceUnavailable": "Bron niet beschikbaar",
-      "macroUnavailable": "Macro- en beleidsgegevens zijn momenteel niet beschikbaar.",
-      "marketUnavailable": "Markt- en kredietgegevens zijn momenteel niet beschikbaar.",
-      "tradeUnavailable": "Handels- en toeleveringsketengegevens zijn momenteel niet beschikbaar.",
-      "energyUnavailable": "Energiegegevens zijn momenteel niet beschikbaar.",
-      "availabilityUnavailable": "Gegevens over gevaren en luchtvaart zijn momenteel niet beschikbaar.",
+      "policyUnavailable": "Official policy and enforcement events are currently unavailable.",
+      "policyPartial": "{{count}} official agencies are temporarily degraded.",
       "status": {
         "loading": "Laden",
         "available": "Beschikbaar",
         "partial": "Gedeeltelijk",
         "stale": "Verouderd",
         "unavailable": "Niet beschikbaar"
-      }
+      },
+      "macroSignals": "Macro Signals",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable."
     }
   },
   "preferences": {

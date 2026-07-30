@@ -16,12 +16,19 @@ import { t } from '@/services/i18n';
 import { createSettingsButton } from '@/components/settings-button';
 import { confirmDialog } from '@/components/confirm-dialog';
 import type { UnifiedSettingsTabId } from '@/components/settings-types';
+import {
+  getPanelToggleA11yState,
+  getSettingsTabNavigationIndex,
+  normalizeSettingsTab,
+  restoreSettingsToggleFocus,
+  updateSettingsTabSelection,
+} from '@/components/unified-settings-interactions';
 import type { MapProvider } from '@/config/basemap';
 import { escapeHtml } from '@/utils/sanitize';
 import type { PanelConfig } from '@/types';
 import { renderPreferences } from '@/services/preferences-content';
 import { renderNotificationsSettings, type NotificationsSettingsResult } from '@/services/notifications-settings';
-import { getAuthState } from '@/services/auth-state';
+import { getAuthState, subscribeAuthState } from '@/services/auth-state';
 import { track } from '@/services/analytics';
 import { isEntitled, hasFeature, onEntitlementChange, getEntitlementState } from '@/services/entitlements';
 import { hasPremiumAccess } from '@/services/panel-gating';
@@ -62,6 +69,7 @@ export interface UnifiedSettingsConfig {
 }
 
 type TabId = UnifiedSettingsTabId;
+type AccountRequest = { userId: string; generation: number };
 
 export class UnifiedSettings {
   private overlay: HTMLElement;
@@ -85,6 +93,7 @@ export class UnifiedSettings {
   private newlyCreatedKey: string | null = null;
   private planLimitNotices: ApiPlanLimitNotice[] = [];
   private planLimitNoticesLoading = false;
+  private planLimitNoticesError = '';
   // ---- Business Pro seats (plan 2026-07-24-001 U7) ----
   private readonly businessSeatsSection: BusinessSeatsSection;
   // ---- Connected MCP clients tab (plan 2026-05-10-001 U9) ----
@@ -94,6 +103,10 @@ export class UnifiedSettings {
   private mcpQuota: McpQuota | null = null;
   /** setInterval handle for quota auto-refresh; cleared on close()/destroy()/tab-switch. */
   private mcpQuotaTimer: ReturnType<typeof setInterval> | null = null;
+  private accountUserId: string | null = getAuthState().user?.id ?? null;
+  private accountDataGeneration = 0;
+  private accountEntitlementRefreshPending = false;
+  private unsubscribeAuth: (() => void) | null = null;
   private unsubscribeEntitlement: (() => void) | null = null;
   private unsubscribeSubscription: (() => void) | null = null;
   // Bounded "entitlement snapshot might still arrive" window. Starts false
@@ -221,15 +234,31 @@ export class UnifiedSettings {
           window.open('/pro', '_blank', 'noopener,noreferrer');
           return;
         }
-        this.toggleDraftPanel(panelItem.dataset.panel);
+        const panelKey = panelItem.dataset.panel;
+        const shouldRestoreFocus = document.activeElement === panelItem;
+        this.toggleDraftPanel(panelKey);
+        restoreSettingsToggleFocus(
+          shouldRestoreFocus,
+          this.overlay.querySelectorAll<HTMLElement>('.panel-toggle-item'),
+          'panel',
+          panelKey,
+        );
         return;
       }
 
       const sourceItem = target.closest<HTMLElement>('.source-toggle-item');
       if (sourceItem?.dataset.source) {
-        this.config.toggleSource(sourceItem.dataset.source);
+        const sourceName = sourceItem.dataset.source;
+        const shouldRestoreFocus = document.activeElement === sourceItem;
+        this.config.toggleSource(sourceName);
         this.renderSourcesGrid();
         this.updateSourcesCounter();
+        restoreSettingsToggleFocus(
+          shouldRestoreFocus,
+          this.overlay.querySelectorAll<HTMLElement>('.source-toggle-item'),
+          'source',
+          sourceName,
+        );
         return;
       }
 
@@ -337,10 +366,56 @@ export class UnifiedSettings {
 
     this.render();
     document.body.appendChild(this.overlay);
+    this.unsubscribeAuth = subscribeAuthState((state) => {
+      this.handleAccountIdentityChange(state.user?.id ?? null);
+    });
+  }
+
+  private handleAccountIdentityChange(nextUserId: string | null): void {
+    if (nextUserId === this.accountUserId) return;
+
+    this.accountUserId = nextUserId;
+    this.accountDataGeneration += 1;
+    this.accountEntitlementRefreshPending = true;
+    this.apiKeys = [];
+    this.apiKeysLoading = false;
+    this.apiKeysError = '';
+    this.newlyCreatedKey = null;
+    this.planLimitNotices = [];
+    this.planLimitNoticesLoading = false;
+    this.planLimitNoticesError = '';
+    this.mcpClients = [];
+    this.mcpClientsLoading = false;
+    this.mcpClientsError = '';
+    this.mcpQuota = null;
+    this.stopMcpQuotaPolling();
+    this.businessSeatsSection.resetForAccountChange();
+
+    // Replace any rendered A-owned plaintext/list data synchronously. Account
+    // loaders stay suppressed until the new entitlement snapshot rerenders.
+    if (this.overlay.classList.contains('active')) {
+      this.entitlementReady = false;
+      this.render(false);
+    }
+  }
+
+  private captureAccountRequest(): AccountRequest | null {
+    const userId = getAuthState().user?.id ?? null;
+    if (!userId || userId !== this.accountUserId) return null;
+    return { userId, generation: this.accountDataGeneration };
+  }
+
+  private isAccountRequestCurrent(request: AccountRequest): boolean {
+    return request.generation === this.accountDataGeneration
+      && request.userId === this.accountUserId
+      && request.userId === getAuthState().user?.id;
   }
 
   public open(tab?: TabId): void {
-    if (tab) this.activeTab = tab;
+    const requestedTab = tab ?? this.activeTab;
+    this.activeTab = requestedTab === 'mcp-clients' && !hasFeature('mcpAccess')
+      ? 'settings'
+      : requestedTab;
     this.resetPanelDraft();
     // Seed entitlementReady BEFORE render() so the first paint of
     // renderUpgradeSection branches on the current snapshot state, not the
@@ -350,18 +425,37 @@ export class UnifiedSettings {
     this.overlay.classList.add('active');
     localStorage.setItem('wm-settings-open', '1');
     document.addEventListener('keydown', this.escapeHandler);
+    (this.overlay.querySelector('.unified-settings-tabs') as HTMLElement)?.addEventListener('keydown', (e: KeyboardEvent) => this.handleKeyDown(e));
     track('settings-open', { tab: tab ?? 'default' });
 
     // Re-render API Keys panel when entitlements arrive (cold-load race:
     // hasFeature('apiAccess') returns false until the Convex subscription
     // delivers data, so a paid API Starter user sees the upgrade CTA briefly).
     this.unsubscribeEntitlement?.();
-    this.unsubscribeEntitlement = onEntitlementChange(() => {
+    this.unsubscribeEntitlement = onEntitlementChange((state) => {
       this.entitlementReady = true;
+      if (this.accountEntitlementRefreshPending) {
+        // Entitlements are account-scoped. Rebuild every account surface so a
+        // direct A→B handoff removes/adds MCP and API tabs using B's snapshot.
+        // Keep the marker through the reset(null) emission; the first real B
+        // snapshot must rebuild once more before ordinary targeted refreshes.
+        if (state !== null) this.accountEntitlementRefreshPending = false;
+        this.render();
+        return;
+      }
+
+      const hasMcpClientsTab = this.overlay.querySelector('[data-tab="mcp-clients"]') !== null;
+      if (hasMcpClientsTab !== hasFeature('mcpAccess')) {
+        // Entitlements can legitimately progress from a free/default snapshot
+        // to Pro after the account handoff's first non-null emission. Rebuild
+        // the tab shape whenever MCP capability changes in either direction.
+        this.render();
+        return;
+      }
+
       const panel = this.overlay.querySelector<HTMLElement>('[data-panel-id="api-keys"]');
       if (panel) {
         setTrustedHtml(panel, trustedHtml(this.renderApiKeysContent(), "legacy direct innerHTML migration"));
-        // Re-attach CTA and input handlers for the refreshed content
         this.attachApiKeysHandlers();
         if (this.activeTab === 'api-keys' && getAuthState().user && hasFeature('apiAccess')) {
           void this.loadApiKeys();
@@ -470,6 +564,8 @@ export class UnifiedSettings {
     this.unsubscribeEntitlement = null;
     this.unsubscribeSubscription?.();
     this.unsubscribeSubscription = null;
+    this.unsubscribeAuth?.();
+    this.unsubscribeAuth = null;
     // Mirror close() — without this, a destroy() during the 12s fallback
     // window leaves the timer live; it fires after teardown and calls
     // replaceUpgradeSection() against a detached overlay (no-op via the
@@ -484,14 +580,31 @@ export class UnifiedSettings {
     this.overlay.remove();
   }
 
-  private render(): void {
+  private handleKeyDown(e: KeyboardEvent): void {
+    if (!(e.target instanceof HTMLElement)) return;
+    const tablist = this.overlay.querySelector('.unified-settings-tabs');
+    if (!tablist || !tablist.contains(e.target)) return;
+    const tabs = Array.from(tablist.querySelectorAll<HTMLButtonElement>('button[role="tab"]'));
+    const currentIndex = tabs.indexOf(e.target.closest('button[role="tab"]') as HTMLButtonElement);
+    const nextIndex = getSettingsTabNavigationIndex(e.key, currentIndex, tabs.length);
+    if (nextIndex === null) return;
+
+    e.preventDefault();
+
+    const nextTab = tabs[nextIndex];
+    const tabId = nextTab?.dataset.tab as TabId | undefined;
+    if (!tabId || !nextTab) return;
+    this.switchTab(tabId);
+    nextTab.focus();
+  }
+
+  private render(loadAccountData = true): void {
     this.prefsCleanup?.();
     this.prefsCleanup = null;
     this.notifCleanup?.();
     this.notifCleanup = null;
     this.pendingNotifs = null;
 
-    const tabClass = (id: TabId) => `unified-settings-tab${this.activeTab === id ? ' active' : ''}`;
     const isSignedIn = !this.config.isDesktopApp && (getAuthState().user !== null);
     const prefs = renderPreferences({
       isDesktopApp: this.config.isDesktopApp,
@@ -502,6 +615,17 @@ export class UnifiedSettings {
     const notifs = showNotificationsTab
       ? renderNotificationsSettings({ isSignedIn })
       : null;
+    const showMcpClientsTab = hasFeature('mcpAccess');
+    const availableTabs: TabId[] = [
+      'settings',
+      'panels',
+      'sources',
+      ...(showNotificationsTab ? ['notifications' as const] : []),
+      'api-keys',
+      ...(showMcpClientsTab ? ['mcp-clients' as const] : []),
+    ];
+    this.activeTab = normalizeSettingsTab(this.activeTab, availableTabs);
+    const tabClass = (id: TabId) => `unified-settings-tab${this.activeTab === id ? ' active' : ''}`;
 
     setTrustedHtml(this.overlay, trustedHtml(`
       <div class="modal unified-settings-modal">
@@ -510,12 +634,12 @@ export class UnifiedSettings {
           <button class="modal-close unified-settings-close" aria-label="Close">\u00d7</button>
         </div>
         <div class="unified-settings-tabs" role="tablist" aria-label="Settings">
-          <button class="${tabClass('settings')}" data-tab="settings" role="tab" aria-selected="${this.activeTab === 'settings'}" id="us-tab-settings" aria-controls="us-tab-panel-settings">${t('header.tabSettings')}</button>
-          <button class="${tabClass('panels')}" data-tab="panels" role="tab" aria-selected="${this.activeTab === 'panels'}" id="us-tab-panels" aria-controls="us-tab-panel-panels">${t('header.tabPanels')}</button>
-          <button class="${tabClass('sources')}" data-tab="sources" role="tab" aria-selected="${this.activeTab === 'sources'}" id="us-tab-sources" aria-controls="us-tab-panel-sources">${t('header.tabSources')}</button>
-          ${showNotificationsTab ? `<button class="${tabClass('notifications')}" data-tab="notifications" role="tab" aria-selected="${this.activeTab === 'notifications'}" id="us-tab-notifications" aria-controls="us-tab-panel-notifications">${t('header.tabNotifications')}</button>` : ''}
-          <button class="${tabClass('api-keys')}" data-tab="api-keys" role="tab" aria-selected="${this.activeTab === 'api-keys'}" id="us-tab-api-keys" aria-controls="us-tab-panel-api-keys">API Keys <span class="panel-pro-badge">PRO</span></button>
-          ${hasFeature('mcpAccess') ? `<button class="${tabClass('mcp-clients')}" data-tab="mcp-clients" role="tab" aria-selected="${this.activeTab === 'mcp-clients'}" id="us-tab-mcp-clients" aria-controls="us-tab-panel-mcp-clients">MCP Clients <span class="panel-pro-badge">PRO</span></button>` : ''}
+          <button class="${tabClass('settings')}" tabindex="${this.activeTab === 'settings' ? 0 : -1}" data-tab="settings" role="tab" aria-selected="${this.activeTab === 'settings'}" id="us-tab-settings" aria-controls="us-tab-panel-settings">${t('header.tabSettings')}</button>
+          <button class="${tabClass('panels')}" tabindex="${this.activeTab === 'panels' ? 0 : -1}" data-tab="panels" role="tab" aria-selected="${this.activeTab === 'panels'}" id="us-tab-panels" aria-controls="us-tab-panel-panels">${t('header.tabPanels')}</button>
+          <button class="${tabClass('sources')}" tabindex="${this.activeTab === 'sources' ? 0 : -1}" data-tab="sources" role="tab" aria-selected="${this.activeTab === 'sources'}" id="us-tab-sources" aria-controls="us-tab-panel-sources">${t('header.tabSources')}</button>
+          ${showNotificationsTab ? `<button class="${tabClass('notifications')}" tabindex="${this.activeTab === 'notifications' ? 0 : -1}" data-tab="notifications" role="tab" aria-selected="${this.activeTab === 'notifications'}" id="us-tab-notifications" aria-controls="us-tab-panel-notifications">${t('header.tabNotifications')}</button>` : ''}
+          <button class="${tabClass('api-keys')}" tabindex="${this.activeTab === 'api-keys' ? 0 : -1}" data-tab="api-keys" role="tab" aria-selected="${this.activeTab === 'api-keys'}" id="us-tab-api-keys" aria-controls="us-tab-panel-api-keys">API Keys <span class="panel-pro-badge">PRO</span></button>
+          ${showMcpClientsTab ? `<button class="${tabClass('mcp-clients')}" tabindex="${this.activeTab === 'mcp-clients' ? 0 : -1}" data-tab="mcp-clients" role="tab" aria-selected="${this.activeTab === 'mcp-clients'}" id="us-tab-mcp-clients" aria-controls="us-tab-panel-mcp-clients">MCP Clients <span class="panel-pro-badge">PRO</span></button>` : ''}
         </div>
         <div class="unified-settings-tab-panel${this.activeTab === 'settings' ? ' active' : ''}" data-panel-id="settings" id="us-tab-panel-settings" role="tabpanel" aria-labelledby="us-tab-settings">
           ${prefs.html}
@@ -557,7 +681,7 @@ export class UnifiedSettings {
         <div class="unified-settings-tab-panel${this.activeTab === 'api-keys' ? ' active' : ''}" data-panel-id="api-keys" id="us-tab-panel-api-keys" role="tabpanel" aria-labelledby="us-tab-api-keys">
           ${this.renderApiKeysContent()}
         </div>
-        ${hasFeature('mcpAccess') ? `
+        ${showMcpClientsTab ? `
         <div class="unified-settings-tab-panel${this.activeTab === 'mcp-clients' ? ' active' : ''}" data-panel-id="mcp-clients" id="us-tab-panel-mcp-clients" role="tabpanel" aria-labelledby="us-tab-mcp-clients">
           ${this.renderMcpClientsContent()}
         </div>
@@ -591,30 +715,28 @@ export class UnifiedSettings {
     this.updateSourcesCounter();
 
     this.attachApiKeysHandlers();
-    if (this.activeTab === 'api-keys' || this.activeTab === 'mcp-clients') {
-      void this.loadPlanLimitNotices();
-    }
-    if (this.activeTab === 'api-keys' && getAuthState().user && hasFeature('apiAccess')) {
-      void this.loadApiKeys();
-    }
-    if (this.activeTab === 'mcp-clients' && getAuthState().user && hasFeature('mcpAccess')) {
-      void this.loadMcpClients();
-      this.startMcpQuotaPolling();
+    if (loadAccountData) {
+      if (this.activeTab === 'api-keys' || this.activeTab === 'mcp-clients') {
+        void this.loadPlanLimitNotices();
+      }
+      if (this.activeTab === 'api-keys' && getAuthState().user && hasFeature('apiAccess')) {
+        void this.loadApiKeys();
+      }
+      if (this.activeTab === 'mcp-clients' && getAuthState().user && hasFeature('mcpAccess')) {
+        void this.loadMcpClients();
+        this.startMcpQuotaPolling();
+      }
     }
   }
 
   private switchTab(tab: TabId): void {
     this.activeTab = tab;
 
-    this.overlay.querySelectorAll('.unified-settings-tab').forEach(el => {
-      const isActive = (el as HTMLElement).dataset.tab === tab;
-      el.classList.toggle('active', isActive);
-      el.setAttribute('aria-selected', String(isActive));
-    });
-
-    this.overlay.querySelectorAll('.unified-settings-tab-panel').forEach(el => {
-      el.classList.toggle('active', (el as HTMLElement).dataset.panelId === tab);
-    });
+    updateSettingsTabSelection(
+      this.overlay.querySelectorAll<HTMLElement>('.unified-settings-tab'),
+      this.overlay.querySelectorAll<HTMLElement>('.unified-settings-tab-panel'),
+      tab,
+    );
 
     if (tab === 'api-keys' && getAuthState().user && hasFeature('apiAccess')) {
       void this.loadPlanLimitNotices();
@@ -862,12 +984,13 @@ export class UnifiedSettings {
       const locked = !entitled;
       const changed = !locked && savedSettings[key]?.enabled !== panel.enabled;
       const displayName = this.config.getLocalizedPanelName(key, resolvedPanel.name ?? panel.name);
+      const a11yState = getPanelToggleA11yState(locked, panel.enabled, displayName);
       return `
-        <div class="panel-toggle-item ${panel.enabled && !locked ? 'active' : ''}${changed ? ' changed' : ''}${locked ? ' pro-locked' : ''}" data-panel="${escapeHtml(key)}" aria-pressed="${panel.enabled && !locked}" ${locked ? 'data-pro-locked="1"' : ''}>
-          <div class="panel-toggle-checkbox">${panel.enabled && !locked ? '\u2713' : ''}${locked ? '\uD83D\uDD12' : ''}</div>
+        <button type="button" class="panel-toggle-item ${panel.enabled && !locked ? 'active' : ''}${changed ? ' changed' : ''}${locked ? ' pro-locked' : ''}" data-panel="${escapeHtml(key)}" ${a11yState.ariaPressed === null ? '' : `aria-pressed="${a11yState.ariaPressed}"`} ${a11yState.ariaLabel === null ? '' : `aria-label="${escapeHtml(a11yState.ariaLabel)}"`} ${locked ? 'data-pro-locked="1"' : ''}>
+          <div  class="panel-toggle-checkbox" aria-hidden="true">${panel.enabled && !locked ? '\u2713' : ''}${locked ? '\uD83D\uDD12' : ''}</div>
           <span class="panel-toggle-label">${escapeHtml(displayName)}</span>
-          ${(locked || resolvedPanel.premium) ? '<span class="panel-toggle-pro-badge">PRO</span>' : ''}
-        </div>
+          ${(locked || resolvedPanel.premium) ? '<span class="panel-toggle-pro-badge" aria-hidden="true">PRO</span>' : ''}
+        </button>
       `;
     }).join(''), "legacy direct innerHTML migration"));
 
@@ -1037,10 +1160,10 @@ export class UnifiedSettings {
       const isEnabled = !disabled.has(source);
       const escaped = escapeHtml(source);
       return `
-        <div class="source-toggle-item ${isEnabled ? 'active' : ''}" data-source="${escaped}">
-          <div class="source-toggle-checkbox">${isEnabled ? '\u2713' : ''}</div>
+        <button type="button" class="source-toggle-item ${isEnabled ? 'active' : ''}" aria-pressed="${isEnabled}" data-source="${escaped}">
+          <div class="source-toggle-checkbox" aria-hidden="true">${isEnabled ? '\u2713' : ''}</div>
           <span class="source-toggle-label">${escaped}</span>
-        </div>
+        </button>
       `;
     }).join(''), "legacy direct innerHTML migration"));
   }
@@ -1057,16 +1180,25 @@ export class UnifiedSettings {
   }
 
   private async loadPlanLimitNotices(): Promise<void> {
-    if (!getAuthState().user || this.planLimitNoticesLoading) return;
+    const request = this.captureAccountRequest();
+    if (!request || this.planLimitNoticesLoading) return;
     this.planLimitNoticesLoading = true;
+    this.planLimitNoticesError = '';
     try {
-      this.planLimitNotices = await listCurrentPlanLimitNotices();
+      const notices = await listCurrentPlanLimitNotices();
+      if (!this.isAccountRequestCurrent(request)) return;
+      this.planLimitNotices = notices;
     } catch (err) {
+      if (!this.isAccountRequestCurrent(request)) return;
       console.warn('[settings] Failed to load API plan-limit notices:', err);
-      this.planLimitNotices = [];
+      this.planLimitNoticesError = err instanceof Error
+        ? err.message
+        : 'Failed to load API plan-limit notices';
     } finally {
-      this.planLimitNoticesLoading = false;
-      this.renderPlanLimitNoticeBlocks();
+      if (this.isAccountRequestCurrent(request)) {
+        this.planLimitNoticesLoading = false;
+        this.renderPlanLimitNoticeBlocks();
+      }
     }
   }
 
@@ -1093,10 +1225,14 @@ export class UnifiedSettings {
   }
 
   private renderPlanLimitNotices(): string {
-    if (this.planLimitNotices.length === 0) return '';
+    if (!this.planLimitNoticesError && this.planLimitNotices.length === 0) return '';
+    const error = this.planLimitNoticesError
+      ? `<div class="api-keys-error api-plan-limit-notices-error" role="alert">${escapeHtml(this.planLimitNoticesError)}</div>`
+      : '';
     const nf = new Intl.NumberFormat();
     return `
       <div class="api-plan-limit-notices" aria-live="polite">
+        ${error}
         ${this.planLimitNotices.map((notice) => {
           const limit = notice.limit == null ? 'unlimited' : nf.format(notice.limit);
           const usage = nf.format(notice.usage);
@@ -1129,11 +1265,15 @@ export class UnifiedSettings {
   }
 
   private async handleAcknowledgePlanLimitNotice(noticeId: string): Promise<void> {
+    const request = this.captureAccountRequest();
+    if (!request) return;
     try {
       await acknowledgePlanLimitNotice(noticeId);
+      if (!this.isAccountRequestCurrent(request)) return;
       this.planLimitNotices = this.planLimitNotices.filter((notice) => notice._id !== noticeId);
       this.renderPlanLimitNoticeBlocks();
     } catch (err) {
+      if (!this.isAccountRequestCurrent(request)) return;
       console.warn('[settings] Failed to acknowledge API plan-limit notice:', err);
       showToast('Could not dismiss this notice. Try again.');
     }
@@ -1256,17 +1396,24 @@ export class UnifiedSettings {
   }
 
   private async loadApiKeys(): Promise<void> {
+    const request = this.captureAccountRequest();
+    if (!request || this.apiKeysLoading) return;
     this.apiKeysLoading = true;
     this.apiKeysError = '';
     this.renderApiKeysList();
 
     try {
-      this.apiKeys = await listApiKeys();
+      const keys = await listApiKeys();
+      if (!this.isAccountRequestCurrent(request)) return;
+      this.apiKeys = keys;
     } catch (err) {
+      if (!this.isAccountRequestCurrent(request)) return;
       this.apiKeysError = err instanceof Error ? err.message : 'Failed to load keys';
     } finally {
-      this.apiKeysLoading = false;
-      this.renderApiKeysList();
+      if (this.isAccountRequestCurrent(request)) {
+        this.apiKeysLoading = false;
+        this.renderApiKeysList();
+      }
     }
   }
 
@@ -1275,6 +1422,8 @@ export class UnifiedSettings {
     const btn = this.overlay.querySelector<HTMLButtonElement>('.api-keys-create-btn');
     const name = input?.value.trim();
     if (!name || !input || !btn) return;
+    const request = this.captureAccountRequest();
+    if (!request) return;
 
     btn.disabled = true;
     btn.textContent = 'Creating...';
@@ -1284,11 +1433,13 @@ export class UnifiedSettings {
 
     try {
       const result = await createApiKey(name);
+      if (!this.isAccountRequestCurrent(request)) return;
       this.newlyCreatedKey = result.key;
       input.value = '';
       this.showCreatedBanner(result.key);
       await this.loadApiKeys();
     } catch (err) {
+      if (!this.isAccountRequestCurrent(request)) return;
       const msg = err instanceof Error ? err.message : 'Failed to create key';
       this.apiKeysError = msg.includes('KEY_LIMIT_REACHED')
         ? 'Maximum of 5 active keys reached. Revoke an existing key first.'
@@ -1297,20 +1448,26 @@ export class UnifiedSettings {
         : msg;
       this.renderApiKeysError();
     } finally {
-      btn.disabled = false;
-      btn.textContent = 'Create Key';
+      if (this.isAccountRequestCurrent(request)) {
+        btn.disabled = false;
+        btn.textContent = 'Create Key';
+      }
     }
   }
 
   private async handleRevokeApiKey(keyId: string): Promise<void> {
+    const request = this.captureAccountRequest();
+    if (!request) return;
     const keyInfo = this.apiKeys.find(k => k.id === keyId);
     const keyName = keyInfo?.name ?? 'this key';
     if (!confirm(`Revoke "${keyName}"? This cannot be undone. Any applications using this key will stop working.`)) return;
 
     try {
       await revokeApiKey(keyId);
+      if (!this.isAccountRequestCurrent(request)) return;
       await this.loadApiKeys();
     } catch (err) {
+      if (!this.isAccountRequestCurrent(request)) return;
       this.apiKeysError = err instanceof Error ? err.message : 'Failed to revoke key';
       this.renderApiKeysError();
     }
@@ -1447,8 +1604,11 @@ export class UnifiedSettings {
       return `<span class="mcp-clients-quota-loading">Loading quota...</span>`;
     }
     const reset = this.formatQuotaReset(q.resetsAt);
+    // `limit: null` = unlimited plan (Enterprise) — there is no denominator to
+    // show, so the counter reads "120 / unlimited".
+    const limitLabel = q.limit === null ? 'unlimited' : String(q.limit);
     return `<span class="mcp-clients-quota-label">MCP daily quota:</span>
-      <strong>${q.used} / ${q.limit}</strong>
+      <strong>${q.used} / ${limitLabel}</strong>
       <span class="mcp-clients-quota-reset">used today, resets ${escapeHtml(reset)}</span>`;
   }
 
@@ -1466,32 +1626,44 @@ export class UnifiedSettings {
   }
 
   private async loadMcpClients(): Promise<void> {
+    const request = this.captureAccountRequest();
+    if (!request || this.mcpClientsLoading) return;
     this.mcpClientsLoading = true;
     this.mcpClientsError = '';
     this.renderMcpClientsList();
 
     try {
-      this.mcpClients = await listMcpClients();
+      const clients = await listMcpClients();
+      if (!this.isAccountRequestCurrent(request)) return;
+      this.mcpClients = clients;
     } catch (err) {
+      if (!this.isAccountRequestCurrent(request)) return;
       this.mcpClientsError = err instanceof Error ? err.message : 'Failed to load MCP clients';
     } finally {
-      this.mcpClientsLoading = false;
-      this.renderMcpClientsList();
+      if (this.isAccountRequestCurrent(request)) {
+        this.mcpClientsLoading = false;
+        this.renderMcpClientsList();
+      }
     }
 
     // Kick a fresh quota fetch alongside the list so the user sees current
     // numbers immediately on tab open (the polling timer takes 30s otherwise).
-    void this.refreshMcpQuota();
+    if (this.isAccountRequestCurrent(request)) void this.refreshMcpQuota();
   }
 
   private async refreshMcpQuota(): Promise<void> {
+    const request = this.captureAccountRequest();
+    if (!request) return;
     try {
-      this.mcpQuota = await fetchMcpQuota();
+      const quota = await fetchMcpQuota();
+      if (!this.isAccountRequestCurrent(request)) return;
+      this.mcpQuota = quota;
     } catch {
+      if (!this.isAccountRequestCurrent(request)) return;
       // fetchMcpQuota already returns sane fallbacks, but defensive catch.
       this.mcpQuota = null;
     }
-    this.renderMcpQuotaInPlace();
+    if (this.isAccountRequestCurrent(request)) this.renderMcpQuotaInPlace();
   }
 
   private renderMcpQuotaInPlace(): void {
@@ -1521,17 +1693,21 @@ export class UnifiedSettings {
   }
 
   private async handleRevokeMcpClient(tokenId: string): Promise<void> {
+    const request = this.captureAccountRequest();
+    if (!request) return;
     const client = this.mcpClients.find(c => c.id === tokenId);
     const label = client?.name?.trim() ? `"${client.name}"` : 'this client';
     if (!confirm(`Revoke ${label}? The connected AI client will need to re-authorize before its next request.`)) return;
 
     try {
       await revokeMcpClient(tokenId);
+      if (!this.isAccountRequestCurrent(request)) return;
       // Refresh both list (Convex query result cached locally) and quota
       // (revoke does not change the daily counter, but the user might have
       // crossed the boundary while the modal was open).
       await this.loadMcpClients();
     } catch (err) {
+      if (!this.isAccountRequestCurrent(request)) return;
       this.mcpClientsError = err instanceof Error ? err.message : 'Failed to revoke MCP client';
       this.renderMcpClientsError();
     }

@@ -142,12 +142,20 @@
     "china": {
       "title": "China Country Snapshot",
       "description": "Current macro, market, trade, energy, and operational availability from existing public data contracts.",
-      "macroPolicy": "Macro & Policy",
-      "marketCredit": "Market & Credit",
-      "tradeSupply": "Trade & Supply Chain",
+      "macroSignals": "Macro Signals",
+      "policyEvents": "Policy & Enforcement",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
       "energy": "Energy",
       "availability": "Hazards & Aviation",
       "observed": "As of:",
+      "published": "Published:",
+      "effective": "Effective:",
+      "sectors": "Sectors:",
+      "entities": "Entities:",
+      "translation": "Translation:",
       "source": "Source:",
       "imfGrowth": "IMF growth forecast",
       "creditGdp": "Credit to GDP",
@@ -156,8 +164,6 @@
       "gasDemand": "Gas demand",
       "energyMix": "Power mix",
       "coal": "coal",
-      "aviationAvailability": "Aviation availability",
-      "hazardAvailability": "Hazard availability",
       "noMajorDisruptions": "No major disruptions reported",
       "activeDisruptions_one": "{{count}} active disruption",
       "activeDisruptions_other": "{{count}} active disruptions",
@@ -169,11 +175,9 @@
       "ccfiSource": "Shanghai Shipping Exchange",
       "comtradeSource": "UN Comtrade reporter 156",
       "sourceUnavailable": "Source unavailable",
-      "macroUnavailable": "Macro and policy data are currently unavailable.",
-      "marketUnavailable": "Market and credit data are currently unavailable.",
-      "tradeUnavailable": "Trade and supply-chain data are currently unavailable.",
-      "energyUnavailable": "Energy data are currently unavailable.",
-      "availabilityUnavailable": "Hazard and aviation availability data are currently unavailable.",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable.",
+      "policyUnavailable": "Unavailable",
+      "policyPartial": "Degraded: {{count}}",
       "status": {
         "loading": "Loading",
         "available": "Available",
@@ -1918,7 +1922,11 @@
       "infoTooltip": "<strong>Disaster Cascade</strong> Detects converging natural disaster and infrastructure signals:<ul><li>Correlates earthquakes, wildfires, floods, and weather extremes</li><li>Tracks cascading effects on infrastructure and supply chains</li><li>Highlights regions with compounding disaster risk</li></ul>Click a card to zoom to the affected region."
     },
     "markets": {
-      "infoTooltip": "<strong>Markets</strong> Real-time stock indices, equities, and crypto prices. Customize your watchlist with the Watchlist button. Sparklines show recent price trend."
+      "infoTooltip": "<strong>Markets</strong> Real-time stock indices, equities, and crypto prices. Customize your watchlist with the Watchlist button. Sparklines show recent price trend.",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>Sector Heatmap</strong> S&P 500 sector performance at a glance. Color intensity reflects the magnitude of daily change. Green = gains, Red = losses."
@@ -2272,6 +2280,22 @@
       "lapsedDesc": "Your Pro subscription has ended. Resubscribe to regain premium access.",
       "resubscribe": "Resubscribe"
     },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
+    },
     "checkoutFailureBanner": {
       "message": "Payment couldn't be completed. No charge was made.",
       "retry": "Try again",
@@ -2319,9 +2343,10 @@
           "summaryVerified": "Unlocked and ready when you are.",
           "channelsNote": "Prefer Telegram, Slack, Discord, or a webhook?",
           "pointers": {
+            "search": "Search the entire dashboard",
             "widgets": "Build a custom widget",
             "analyst": "Ask the AI analyst",
-            "apiKeys": "Get your API & MCP keys",
+            "mcpClients": "Set up MCP",
             "channels": "Set those up in notification settings"
           }
         }

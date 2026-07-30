@@ -134,12 +134,15 @@
     "china": {
       "title": "Обзор по Китаю",
       "description": "Текущие макроэкономика, рынок, торговля, энергетика и операционная доступность на основе существующих публичных контрактов данных.",
-      "macroPolicy": "Макро и политика",
-      "marketCredit": "Рынок и кредит",
-      "tradeSupply": "Торговля и цепочки поставок",
+      "policyEvents": "Policy & Enforcement",
       "energy": "Энергетика",
       "availability": "Опасности и авиация",
       "observed": "По состоянию на:",
+      "published": "Published:",
+      "effective": "Effective:",
+      "sectors": "Sectors:",
+      "entities": "Entities:",
+      "translation": "Translation:",
       "source": "Источник:",
       "imfGrowth": "Прогноз роста МВФ",
       "creditGdp": "Кредит к ВВП",
@@ -148,8 +151,6 @@
       "gasDemand": "Спрос на газ",
       "energyMix": "Структура энергобаланса",
       "coal": "уголь",
-      "aviationAvailability": "Доступность авиации",
-      "hazardAvailability": "Доступность данных об опасностях",
       "noMajorDisruptions": "Существенных сбоев не зарегистрировано",
       "activeDisruptions_one": "{{count}} активный сбой",
       "activeDisruptions_few": "{{count}} активных сбоя",
@@ -165,18 +166,21 @@
       "ccfiSource": "Шанхайская судоходная биржа",
       "comtradeSource": "ООН Comtrade, отчитывающаяся сторона 156",
       "sourceUnavailable": "Источник недоступен",
-      "macroUnavailable": "Данные по макроэкономике и политике временно недоступны.",
-      "marketUnavailable": "Данные по рынку и кредиту временно недоступны.",
-      "tradeUnavailable": "Данные по торговле и цепочкам поставок временно недоступны.",
-      "energyUnavailable": "Данные по энергетике временно недоступны.",
-      "availabilityUnavailable": "Данные об опасностях и авиации временно недоступны.",
+      "policyUnavailable": "Official policy and enforcement events are currently unavailable.",
+      "policyPartial": "{{count}} official agencies are temporarily degraded.",
       "status": {
         "loading": "Загрузка",
         "available": "Доступно",
         "partial": "Частично",
         "stale": "Устарело",
         "unavailable": "Недоступно"
-      }
+      },
+      "macroSignals": "Macro Signals",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable."
     }
   },
   "header": {
@@ -2145,7 +2149,11 @@
       "infoTooltip": "<strong>Disaster Cascade</strong> Обнаруживает сходящиеся сигналы природных бедствий и инфраструктуры:<ul><li>Коррелирует землетрясения, лесные пожары, наводнения и экстремальную погоду</li><li>Отслеживает каскадные эффекты на инфраструктуру и цепи поставок</li><li>Выделяет регионы с сопутствующим риском бедствий</li></ul>Нажмите на карточку, чтобы увеличить затронутый регион."
     },
     "markets": {
-      "infoTooltip": "<strong>Markets</strong> Котировки индексов в реальном времени, акции и цены крипто. Настройте свой список отслеживания с помощью кнопки Список отслеживания. Спарклайны показывают недавний ценовой тренд."
+      "infoTooltip": "<strong>Markets</strong> Котировки индексов в реальном времени, акции и цены крипто. Настройте свой список отслеживания с помощью кнопки Список отслеживания. Спарклайны показывают недавний ценовой тренд.",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>Sector Heatmap</strong> Производительность секторов S&P 500 с первого взгляда. Интенсивность цвета отражает величину дневного изменения. Зеленый = прибыль, Красный = убытки."
@@ -2265,9 +2273,10 @@
           "summaryVerified": "Разблокировано и готово, когда будете готовы вы.",
           "channelsNote": "Предпочитаете Telegram, Slack, Discord или вебхук?",
           "pointers": {
+            "search": "Искать по всей панели",
             "widgets": "Создать пользовательский виджет",
             "analyst": "Спросить AI-аналитика",
-            "apiKeys": "Получить ваши ключи API и MCP",
+            "mcpClients": "Настроить MCP",
             "channels": "Настройте их в настройках уведомлений"
           }
         }
@@ -2530,6 +2539,22 @@
         "compactHours": "{{count}}h",
         "compactDays": "{{count}}d"
       }
+    },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
     }
   },
   "popups": {

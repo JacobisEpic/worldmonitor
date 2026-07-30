@@ -134,12 +134,15 @@
     "china": {
       "title": "Преглед на държава: Китай",
       "description": "Текущо състояние на макроикономика, пазар, търговия, енергетика и оперативна наличност от съществуващите публични договори за данни.",
-      "macroPolicy": "Макро и политика",
-      "marketCredit": "Пазар и кредит",
-      "tradeSupply": "Търговия и вериги на доставки",
+      "policyEvents": "Policy & Enforcement",
       "energy": "Енергетика",
       "availability": "Опасности и авиация",
       "observed": "Към:",
+      "published": "Published:",
+      "effective": "Effective:",
+      "sectors": "Sectors:",
+      "entities": "Entities:",
+      "translation": "Translation:",
       "source": "Източник:",
       "imfGrowth": "Прогноза за растеж на МВФ",
       "creditGdp": "Кредит към БВП",
@@ -148,8 +151,6 @@
       "gasDemand": "Търсене на газ",
       "energyMix": "Електроенергиен микс",
       "coal": "въглища",
-      "aviationAvailability": "Наличност на авиацията",
-      "hazardAvailability": "Наличност на опасностите",
       "noMajorDisruptions": "Няма съобщени сериозни смущения",
       "activeDisruptions_one": "{{count}} активно прекъсване",
       "activeDisruptions_other": "{{count}} активни прекъсвания",
@@ -161,18 +162,21 @@
       "ccfiSource": "Шанхайска корабна борса",
       "comtradeSource": "UN Comtrade, докладваща страна 156",
       "sourceUnavailable": "Източникът не е наличен",
-      "macroUnavailable": "Макроикономическите и политическите данни в момента не са налични.",
-      "marketUnavailable": "Пазарните и кредитните данни в момента не са налични.",
-      "tradeUnavailable": "Данните за търговия и вериги на доставки в момента не са налични.",
-      "energyUnavailable": "Енергийните данни в момента не са налични.",
-      "availabilityUnavailable": "Данните за опасности и авиация в момента не са налични.",
+      "policyUnavailable": "Official policy and enforcement events are currently unavailable.",
+      "policyPartial": "{{count}} official agencies are temporarily degraded.",
       "status": {
         "loading": "Зареждане",
         "available": "Налично",
         "partial": "Частично",
         "stale": "Остаряло",
         "unavailable": "Неналично"
-      }
+      },
+      "macroSignals": "Macro Signals",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable."
     }
   },
   "header": {
@@ -2127,7 +2131,11 @@
       "infoTooltip": "<strong>Каскада от災害</strong> Открива конвергиращи сигнали от природни бедствия и инфраструктура:<ul><li>Корелира земетресения, горски пожари, наводнения и екстремни времеви явления</li><li>Проследява каскадни ефекти на инфраструктура и верига на доставки</li><li>Подчертава региони с натрупан риск от бедствия</li></ul>Кликнете върху карта, за да увеличите мащаба на засегнатия регион."
     },
     "markets": {
-      "infoTooltip": "<strong>Пазари</strong> Цени в реално време на фондови индекси, акции и крипто. Персонализирайте списъка си с наблюдавани стойности с помощта на бутона Списък на наблюдаване. Спарклайните показват скорошния тренд на цената."
+      "infoTooltip": "<strong>Пазари</strong> Цени в реално време на фондови индекси, акции и крипто. Персонализирайте списъка си с наблюдавани стойности с помощта на бутона Списък на наблюдаване. Спарклайните показват скорошния тренд на цената.",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>Хартата на топлината на секторите</strong> Производителност на секторите на S&P 500 с един поглед. Интензивността на цвета отразява величината на дневната промяна. Зелено = печалби, Червено = загуби."
@@ -2247,9 +2255,10 @@
           "summaryVerified": "Отключен и готов, когато сте готови и вие.",
           "channelsNote": "Предпочитате Telegram, Slack, Discord или уебхук?",
           "pointers": {
+            "search": "Търси в цялото табло",
             "widgets": "Създай персонализиран уиджет",
             "analyst": "Попитай AI анализатора",
-            "apiKeys": "Вземи своите API и MCP ключове",
+            "mcpClients": "Настрой MCP",
             "channels": "Настройте ги в настройките за известия"
           }
         }
@@ -2494,6 +2503,22 @@
         "compactHours": "{{count}}h",
         "compactDays": "{{count}}d"
       }
+    },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
     }
   },
   "popups": {

@@ -637,9 +637,15 @@ export default defineSchema({
     // "your access ended ~a month ago", so access end is the right clock.
     .index("by_status_currentPeriodEnd", ["status", "currentPeriodEnd"]),
 
-  // Cross-device single-presentation lease for markerless Pro activation.
-  // A short pending claim closes concurrent mount races without permanently
-  // suppressing onboarding when a browser crashes before rendering the flow.
+  // What happened in a Pro-activation session, one row per subscription per
+  // cohort (see `cohort` below).
+  //
+  // For the markerless retro cohort the row is ALSO a cross-device
+  // single-presentation lease: a short pending claim closes concurrent mount
+  // races without permanently suppressing onboarding when a browser crashes
+  // before rendering the flow. The day-0 cohort has no lease — its fire-once
+  // is the browser-local checkout marker — so its row is purely the outcome
+  // record.
   //
   // The outcome buckets mirror ActivationStepOutcome
   // (pro-activation-state.ts). They are updated as the subscriber acts so a
@@ -648,8 +654,23 @@ export default defineSchema({
   proActivationPresentations: defineTable({
     userId: v.string(),
     subscriptionId: v.id("subscriptions"),
+    // Which activation cohort this row records (#5621). ABSENT is the
+    // markerless retro backfill — the only cohort that existed before, so
+    // every pre-#5621 row reads correctly with no backfill, and the lease
+    // lookups keep matching them by querying `cohort: undefined`.
+    // "day0" is the post-checkout welcome session. The two are SEPARATE rows
+    // for one subscription on purpose: day-0 carries no lease (its fire-once
+    // is the browser-local checkout marker), so a day-0 row must never occupy
+    // the retro claim slot or set the `presentedAt` gate that suppresses a
+    // later legitimate backfill for a subscriber whose day-0 writes all
+    // failed (#5600).
+    cohort: v.optional(v.literal("day0")),
     claimNonce: v.string(),
     claimedAt: v.number(),
+    // Day-0 only: client-generated session start used with claimNonce as a
+    // total ownership order. Optional so rows written before the ordered
+    // takeover contract deploy without a backfill.
+    sessionStartedAt: v.optional(v.number()),
     presentedAt: v.optional(v.number()),
     // Set when a presentation is confirmed by an outcome-aware client. This
     // excludes rows created before #5582 without losing post-deploy sessions
@@ -657,12 +678,26 @@ export default defineSchema({
     outcomeTrackingVersion: v.optional(v.literal(1)),
     confirmedSteps: v.optional(v.array(proActivationStepIdValidator)),
     skippedSteps: v.optional(v.array(proActivationStepIdValidator)),
+    // Browser-refused steps (#5617). A separate bucket rather than a marker on
+    // `skippedSteps` so rows written before it existed stay valid and every
+    // existing consumer of the original three keeps its exact meaning.
+    //
+    // ROLLBACK: once any row has this field populated, deleting this line fails
+    // the Convex deploy — schema validation rejects a stored field the
+    // validator does not declare. To revert, revert the WRITE path (the client
+    // and the mutation arg) and leave this field in place; drop it only after
+    // the surviving rows have aged out.
+    blockedSteps: v.optional(v.array(proActivationStepIdValidator)),
     failedSteps: v.optional(v.array(proActivationStepIdValidator)),
     outcomeRevision: v.optional(v.number()),
     outcomeUpdatedAt: v.optional(v.number()),
     exitedAt: v.optional(v.number()),
   })
-    .index("by_subscription", ["subscriptionId"]),
+    // Cohort is part of the key so each lookup names the row it means. A
+    // prefix query on `subscriptionId` alone still reads BOTH cohorts (used
+    // by subscription deletion); every lease/outcome lookup pins the second
+    // component so it can never cross cohorts.
+    .index("by_subscription_cohort", ["subscriptionId", "cohort"]),
 
   // Dunning/winback send ledger (#4932): one row per email step actually
   // delivered for a given subscription episode. `episodeAt` is the on_hold
@@ -710,6 +745,11 @@ export default defineSchema({
       // validator MUST accept it or the webhook's entitlement write is
       // rejected (v.object is strict on extra keys).
       apiDailyAllowance: v.optional(v.number()),
+      // Optional — data-export entitlement (plan 2026-07-25-001). Legacy rows
+      // predate it; consumers treat undefined on a tier >= 2 row as entitled
+      // (fail-OPEN, permanently — see the PlanFeatures JSDoc). Catalog-sourced
+      // writes always set it, so this validator MUST accept it.
+      dataExport: v.optional(v.boolean()),
     }),
     validUntil: v.number(),
     // Optional complimentary-entitlement floor. When set and in the future,
@@ -1020,4 +1060,110 @@ export default defineSchema({
   })
     .index("by_webhookEventId", ["webhookEventId"])
     .index("by_broadcast_event", ["broadcastId", "eventType"]),
+
+  // Pre-seeded, document-backed serialization point for `intelHistory.append`.
+  //
+  // Convex does not treat an empty `by_dedupeKey` index range as a conflict
+  // dependency, so concurrent first-seen appends could both see no row and
+  // insert the same key. `intelHistory.append` reads and patches this
+  // always-existing singleton before checking dedupe keys, making the OCC
+  // dependency document-backed. The historical seeders are low-frequency,
+  // so one global serialization point is intentional and keeps the invariant
+  // simple. It is seeded by the deploy workflow; append fails loudly if it is
+  // absent rather than silently weakening idempotency.
+  intelHistoryAppendLocks: defineTable({
+    lockKey: v.string(),
+    lastTouchedAt: v.number(),
+  }).index("by_lockKey", ["lockKey"]),
+
+  // Append-only historical intelligence memory (#5694). Seeders publish a
+  // rolling live snapshot to Redis that overwrites itself every run; this
+  // table is the durable long tail behind it — one row per distinct event,
+  // never updated in place. `dedupeKey` is the seeder-side identity of an
+  // event, so a re-publish of the same event is a skip, not a second row
+  // (see `append` in convex/intelHistory.ts).
+  //
+  // EMBEDDING CONTRACT — `embedding` is produced by
+  // openai/text-embedding-3-small at 512 dimensions: the SAME model and
+  // dimension pair the brief deduper uses (EMBED_MODEL / EMBED_DIMS in
+  // scripts/lib/brief-dedup-consts.mjs). The vector index below hard-codes
+  // `dimensions: 512` and Convex rejects a stored vector of any other length,
+  // so changing the model OR the dimension is a table migration (a new /
+  // version-suffixed table plus a full re-embed) — NOT an in-place edit of
+  // this number. Mixing vectors from two models in one index is worse than a
+  // hard failure: the search still returns results, they are just ranked
+  // against a similarity scale that no longer means anything. The deduper
+  // carries the same warning on its CACHE_VERSION prefix.
+  intelHistory: defineTable({
+    // "conflict" | "military" | "energy" today. Deliberately v.string() and
+    // not a v.union of literals: a new seeder domain should be a code change
+    // in the collector, not a schema deploy that has to land first.
+    domain: v.string(),
+    resource: v.string(),
+    country: v.optional(v.string()),
+    category: v.optional(v.string()),
+    title: v.string(),
+    summary: v.optional(v.string()),
+    sourceUrl: v.optional(v.string()),
+    // Event time as reported by the source, vs. the time we stored it. Both
+    // are kept: reads are ordered by `occurredAt` (what a user means by "what
+    // happened last week") while retention ages rows out by `ingestedAt` (so
+    // a backfill of old events is not deleted by the next prune tick).
+    occurredAt: v.number(),
+    ingestedAt: v.number(),
+    runId: v.string(),
+    dedupeKey: v.string(),
+    embedding: v.array(v.float64()),
+  })
+    .index("by_dedupeKey", ["dedupeKey"])
+    .index("by_ingestedAt", ["ingestedAt"])
+    .index("by_domain_occurredAt", ["domain", "occurredAt"])
+    .index("by_country_occurredAt", ["country", "occurredAt"])
+    // Convex's vector-index filter builder supports only `eq` and `or` — there
+    // is no `and`. A query scoped to BOTH domain and country therefore pushes
+    // one field down and post-filters the other; see `search` in
+    // convex/intelHistory.ts for which one and why.
+    .vectorIndex("by_embedding", {
+      vectorField: "embedding",
+      dimensions: 512,
+      filterFields: ["domain", "country"],
+    }),
+
+  // Retraction tombstones for `intelHistory` (#5743).
+  //
+  // Deleting a poisoned or wrong history row is not enough on its own. The
+  // producing seeders republish a rolling window every run, and `append`
+  // decides "already stored?" by looking for a row with the same `dedupeKey` —
+  // so a bare delete is undone by the next seed tick, usually within the hour.
+  // A retraction therefore writes a tombstone keyed on the same `dedupeKey`
+  // the delete removed, and `append` skips any record that matches one.
+  //
+  // Tombstones, not a soft-delete flag on `intelHistory`: the row must
+  // genuinely leave the vector index (that is the whole point of a retraction,
+  // and a filtered-out row still costs index space and can still be ranked),
+  // while the identity has to survive it. They age out on the same 180-day
+  // clock as the history itself — by `retractedAt`, so the window starts when
+  // the operator acted rather than when the event happened.
+  intelHistoryRetractions: defineTable({
+    // Matches `intelHistory.dedupeKey` exactly. One row per retracted
+    // identity; re-retracting the same key refreshes it rather than
+    // accumulating duplicates.
+    dedupeKey: v.string(),
+    // When suppression was last ASSERTED — not when the operator first acted.
+    // `retract` sets it, and every `append` this tombstone suppresses refreshes
+    // it, because a record still arriving from the producer is evidence the
+    // feed has not stopped serving it and expiry would be premature. Expiry is
+    // therefore measured from the producer's last attempt, so `listRetractions`
+    // orders by "most recently still-live" rather than by when someone typed
+    // the command. The original action time lives in the `reason` an operator
+    // is required to supply and in the `intel_history_retracted` breadcrumb.
+    retractedAt: v.number(),
+    // Free text from the operator, e.g. "poisoned RSS item, #5743". Required
+    // at the relay boundary: a tombstone with no stated cause is unreviewable
+    // six weeks later, when the only question that matters is whether it is
+    // still deserved.
+    reason: v.string(),
+  })
+    .index("by_dedupeKey", ["dedupeKey"])
+    .index("by_retractedAt", ["retractedAt"]),
 });

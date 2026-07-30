@@ -134,12 +134,15 @@
     "china": {
       "title": "لمحة قطرية عن الصين",
       "description": "الوضع الحالي للاقتصاد الكلي والأسواق والتجارة والطاقة والتوافر التشغيلي من عقود البيانات العامة القائمة.",
-      "macroPolicy": "الاقتصاد الكلي والسياسات",
-      "marketCredit": "السوق والائتمان",
-      "tradeSupply": "التجارة وسلاسل الإمداد",
+      "policyEvents": "Policy & Enforcement",
       "energy": "الطاقة",
       "availability": "المخاطر والطيران",
       "observed": "اعتبارًا من:",
+      "published": "Published:",
+      "effective": "Effective:",
+      "sectors": "Sectors:",
+      "entities": "Entities:",
+      "translation": "Translation:",
       "source": "المصدر:",
       "imfGrowth": "توقعات النمو من صندوق النقد الدولي",
       "creditGdp": "الائتمان إلى الناتج المحلي الإجمالي",
@@ -148,8 +151,6 @@
       "gasDemand": "الطلب على الغاز",
       "energyMix": "مزيج الكهرباء",
       "coal": "الفحم",
-      "aviationAvailability": "توافر الطيران",
-      "hazardAvailability": "توافر بيانات المخاطر",
       "noMajorDisruptions": "لم يُبلَّغ عن اضطرابات كبيرة",
       "activeDisruptions_zero": "لا توجد اضطرابات نشطة",
       "activeDisruptions_one": "اضطراب نشط واحد",
@@ -169,18 +170,21 @@
       "ccfiSource": "بورصة شنغهاي للشحن",
       "comtradeSource": "قاعدة الأمم المتحدة كومتريد، الجهة المبلغة 156",
       "sourceUnavailable": "المصدر غير متاح",
-      "macroUnavailable": "بيانات الاقتصاد الكلي والسياسات غير متاحة حاليًا.",
-      "marketUnavailable": "بيانات السوق والائتمان غير متاحة حاليًا.",
-      "tradeUnavailable": "بيانات التجارة وسلاسل الإمداد غير متاحة حاليًا.",
-      "energyUnavailable": "بيانات الطاقة غير متاحة حاليًا.",
-      "availabilityUnavailable": "بيانات توافر المخاطر والطيران غير متاحة حاليًا.",
+      "policyUnavailable": "Official policy and enforcement events are currently unavailable.",
+      "policyPartial": "{{count}} official agencies are temporarily degraded.",
       "status": {
         "loading": "جارٍ التحميل",
         "available": "متاح",
         "partial": "جزئي",
         "stale": "قديم",
         "unavailable": "غير متاح"
-      }
+      },
+      "macroSignals": "Macro Signals",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable."
     }
   },
   "header": {
@@ -2163,7 +2167,11 @@
       "infoTooltip": "<strong>تسلسل الكوارث</strong> يكتشف الكوارث الطبيعية وإشارات البنية التحتية المتقاربة:<ul><li>يربط الزلازل والحرائق البرية والفيضانات والطقس الشديد</li><li>يتتبع الآثار المتسلسلة على البنية التحتية وسلسلة التوريد</li><li>يبرز المناطق ذات مخاطر الكوارث المركبة</li></ul>انقر على بطاقة للتكبير على المنطقة المتأثرة."
     },
     "markets": {
-      "infoTooltip": "<strong>الأسواق</strong> مؤشرات الأسهم والأسهم والأسعار المشفرة في الوقت الفعلي. خصص قائمة المراقبة الخاصة بك باستخدام زر قائمة المراقبة. تعرض الرسوم البيانية الصغيرة اتجاه السعر الأخير."
+      "infoTooltip": "<strong>الأسواق</strong> مؤشرات الأسهم والأسهم والأسعار المشفرة في الوقت الفعلي. خصص قائمة المراقبة الخاصة بك باستخدام زر قائمة المراقبة. تعرض الرسوم البيانية الصغيرة اتجاه السعر الأخير.",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>خريطة حرارية للقطاعات</strong> أداء قطاع S&P 500 في لمحة. يعكس كثافة اللون مقدار التغيير اليومي. الأخضر = أرباح، الأحمر = خسائر."
@@ -2283,9 +2291,10 @@
           "summaryVerified": "غير مقفلة وجاهزة عندما تكون جاهزًا.",
           "channelsNote": "تفضّل Telegram أو Slack أو Discord أو webhook؟",
           "pointers": {
+            "search": "البحث في لوحة المعلومات بالكامل",
             "widgets": "إنشاء أداة مخصصة",
             "analyst": "اسأل المحلل الذكي",
-            "apiKeys": "احصل على مفاتيح API و MCP الخاصة بك",
+            "mcpClients": "إعداد MCP",
             "channels": "أعدّها في إعدادات الإشعارات"
           }
         }
@@ -2566,6 +2575,22 @@
         "compactHours": "{{count}}h",
         "compactDays": "{{count}}d"
       }
+    },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
     }
   },
   "popups": {

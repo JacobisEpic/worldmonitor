@@ -134,12 +134,15 @@
     "china": {
       "title": "中国国家概览",
       "description": "基于现有公共数据契约的宏观、市场、贸易、能源与运行可用性现状。",
-      "macroPolicy": "宏观与政策",
-      "marketCredit": "市场与信贷",
-      "tradeSupply": "贸易与供应链",
+      "policyEvents": "政策与执法",
       "energy": "能源",
       "availability": "灾害与航空",
       "observed": "数据日期：",
+      "published": "发布日期：",
+      "effective": "生效日期：",
+      "sectors": "涉及行业：",
+      "entities": "涉及实体：",
+      "translation": "翻译状态：",
       "source": "来源：",
       "imfGrowth": "IMF 增长预测",
       "creditGdp": "信贷占 GDP 比重",
@@ -148,8 +151,6 @@
       "gasDemand": "天然气需求",
       "energyMix": "电力结构",
       "coal": "煤炭",
-      "aviationAvailability": "航空可用性",
-      "hazardAvailability": "灾害可用性",
       "noMajorDisruptions": "未报告重大中断",
       "activeDisruptions_one": "{{count}} 起活跃中断",
       "activeDisruptions_other": "{{count}} 起活跃中断",
@@ -161,18 +162,21 @@
       "ccfiSource": "上海航运交易所",
       "comtradeSource": "联合国商品贸易数据库（报告方 156）",
       "sourceUnavailable": "来源不可用",
-      "macroUnavailable": "宏观与政策数据目前不可用。",
-      "marketUnavailable": "市场与信贷数据目前不可用。",
-      "tradeUnavailable": "贸易与供应链数据目前不可用。",
-      "energyUnavailable": "能源数据目前不可用。",
-      "availabilityUnavailable": "灾害与航空可用性数据目前不可用。",
+      "policyUnavailable": "官方政策与执法事件目前不可用。",
+      "policyPartial": "{{count}} 个官方机构的数据暂时降级。",
       "status": {
         "loading": "加载中",
         "available": "可用",
         "partial": "部分",
         "stale": "过期",
         "unavailable": "不可用"
-      }
+      },
+      "macroSignals": "Macro Signals",
+      "crossStraitActivity": "Cross-Strait Activity",
+      "corporateDisclosures": "Corporate Disclosures",
+      "corridorConditions": "Corridor Conditions",
+      "activityNowcast": "Activity Nowcast",
+      "decisionSignalsUnavailable": "The China decision-signal snapshot is currently unavailable."
     }
   },
   "header": {
@@ -2127,7 +2131,11 @@
       "infoTooltip": "<strong>灾难级联</strong> 检测汇聚的自然灾害和基础设施信号：<ul><li>关联地震、野火、洪灾和极端天气</li><li>追踪对基础设施和供应链的级联影响</li><li>突出具有复合灾难风险的地区</li></ul>点击卡片可在地图上放大到受影响区域。"
     },
     "markets": {
-      "infoTooltip": "<strong>市场</strong> 实时股票指数、股票和加密货币价格。使用\"观察列表\"按钮自定义您的观察列表。火花线显示最近价格趋势。"
+      "infoTooltip": "<strong>市场</strong> 实时股票指数、股票和加密货币价格。使用\"观察列表\"按钮自定义您的观察列表。火花线显示最近价格趋势。",
+      "chart": {
+        "title": "{{symbol}} price chart",
+        "close": "Close chart"
+      }
     },
     "heatmap": {
       "infoTooltip": "<strong>板块热力图</strong> S&P 500 板块表现一览。颜色强度反映每日变化幅度。绿色 = 涨幅，红色 = 跌幅。"
@@ -2247,9 +2255,10 @@
           "summaryVerified": "已解锁，随时可用。",
           "channelsNote": "更喜欢 Telegram、Slack、Discord 还是 Webhook？",
           "pointers": {
+            "search": "搜索整个仪表板",
             "widgets": "创建自定义小组件",
             "analyst": "咨询 AI 分析师",
-            "apiKeys": "获取您的 API 和 MCP 密钥",
+            "mcpClients": "设置 MCP",
             "channels": "在通知设置中进行配置"
           }
         }
@@ -2494,6 +2503,22 @@
         "compactHours": "{{count}}h",
         "compactDays": "{{count}}d"
       }
+    },
+    "exportGate": {
+      "signedOutDesc": "Sign in to export dashboard data as CSV, JSON or PDF.",
+      "upgradeDesc": "Data export (CSV, JSON, PDF) is included with Pro Business.",
+      "upgradeCta": "Upgrade to Pro Business",
+      "lockedAriaLabel": "Export data — locked. {{reason}}",
+      "unlockedAnnouncement": "Data export unlocked.",
+      "preparingPdf": "Preparing PDF…",
+      "pdfFailed": "The PDF report could not be generated. Try again, or use the JSON export."
+    },
+    "tabCap": {
+      "signedOutDesc": "Signed-out workspaces are limited to {{cap}} dashboard tabs. Sign in to add more.",
+      "upgradeDesc": "You've reached your limit of {{cap}} dashboard tabs.",
+      "upgradeCta": "Upgrade for more",
+      "lockedAriaLabel": "Add tab — locked. {{reason}}",
+      "unlockedAnnouncement": "Dashboard tab limit lifted."
     }
   },
   "popups": {
