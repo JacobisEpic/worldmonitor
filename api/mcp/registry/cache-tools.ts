@@ -1155,7 +1155,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     name: 'get_prediction_markets',
     _uiResourceUri: PREDICTION_MARKETS_UI_URI,
     _outputBudgetBytes: 131072,
-    description: 'Active Polymarket event contracts with current probabilities. Covers geopolitical, economic, and election prediction markets.',
+    description: 'Active prediction markets: geopolitical (geopolitics/elections), tech (AI/crypto/science), finance (financial/economic). Contracts include current probabilities; tech membership requires matching classifier tags, so coverage varies by venue.',
     inputSchema: {
       type: 'object',
       properties: {
