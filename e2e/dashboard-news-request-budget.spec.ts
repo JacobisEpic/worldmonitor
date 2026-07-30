@@ -381,3 +381,220 @@ test.describe('dashboard news request budget (#5376)', () => {
     ).toBe(afterRecovery);
   });
 });
+
+const STABLECOIN_GLOB = '**/api/market/v1/list-stablecoin-markets*';
+const SCROLL_HYDRATION_PANEL_ORDER = [
+  'live-news',
+  'intel',
+  'gdelt-intel',
+  'cii',
+  'cascade',
+  'strategic-risk',
+  'politics',
+  'us',
+  'europe',
+  'stablecoins',
+  'middleeast',
+  'africa',
+  'latam',
+  'asia',
+  'energy',
+  'gov',
+  'thinktanks',
+  'polymarket',
+  'commodities',
+  'markets',
+  'stock-analysis',
+  'stock-backtest',
+  'daily-market-brief',
+  'economic',
+  'finance',
+  'tech',
+  'crypto',
+  'heatmap',
+  'ai',
+  'macro-signals',
+  'etf-flows',
+  'monitors',
+];
+
+type ScrollMetrics = {
+  clientHeight: number;
+  scrollHeight: number;
+  scrollTop: number;
+  targetTop: number;
+  viewportHeight: number;
+};
+
+async function seedScrollableDashboard(page: Page): Promise<void> {
+  await seedFreshAnonymousFullVariant(page, {
+    stablecoins: { name: 'Stablecoins', enabled: true, priority: 1 },
+  });
+  await page.addInitScript((panelOrder: string[]) => {
+    localStorage.setItem('worldmonitor-panel-order-v1.9', 'done');
+    localStorage.setItem('worldmonitor-panel-prune-v1', 'done');
+    localStorage.setItem('worldmonitor-layout-reset-v2.5', 'done');
+    localStorage.setItem('panel-order', JSON.stringify(panelOrder));
+  }, SCROLL_HYDRATION_PANEL_ORDER);
+}
+
+async function installStablecoinContract(page: Page): Promise<string[]> {
+  const requests: string[] = [];
+
+  await page.route(/^https?:\/\/(?!(127\.0\.0\.1:4173|localhost:4173)(?:\/|$)).*/i, (route) => {
+    return route.abort('blockedbyclient');
+  });
+  await page.route(STABLECOIN_GLOB, async (route) => {
+    requests.push(route.request().url());
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        stablecoins: [{
+          symbol: 'TEST',
+          name: 'Test Dollar',
+          price: 1,
+          marketCap: 1_000_000,
+          volume24h: 100_000,
+          change24h: 0,
+          pegStatus: 'ON PEG',
+          deviation: 0,
+        }],
+        summary: {
+          totalMarketCap: 1_000_000,
+          totalVolume24h: 100_000,
+          coinCount: 1,
+          depeggedCount: 0,
+          healthStatus: 'HEALTHY',
+        },
+      }),
+    });
+  });
+  return requests;
+}
+
+async function readScrollMetrics(page: Page): Promise<ScrollMetrics> {
+  return page.evaluate(() => {
+    const main = document.querySelector('.main-content');
+    const target = document.querySelector('[data-panel="stablecoins"]');
+    if (!(main instanceof HTMLElement) || !(target instanceof HTMLElement)) {
+      throw new Error('missing dashboard scroll test elements');
+    }
+    return {
+      clientHeight: main.clientHeight,
+      scrollHeight: main.scrollHeight,
+      scrollTop: main.scrollTop,
+      targetTop: target.getBoundingClientRect().top,
+      viewportHeight: window.innerHeight,
+    };
+  });
+}
+
+async function scrollTargetIntoView(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const main = document.querySelector('.main-content');
+    const target = document.querySelector('[data-panel="stablecoins"]');
+    if (!(main instanceof HTMLElement) || !(target instanceof HTMLElement)) {
+      throw new Error('missing dashboard scroll test elements');
+    }
+    const targetTopInScroller =
+      target.getBoundingClientRect().top - main.getBoundingClientRect().top + main.scrollTop;
+    main.scrollTop = Math.max(1, targetTopInScroller - main.clientHeight + 200);
+  });
+}
+
+async function scrollAgainAfterMount(page: Page): Promise<{ before: number; after: number }> {
+  return page.evaluate(() => {
+    const main = document.querySelector('.main-content');
+    if (!(main instanceof HTMLElement)) throw new Error('missing dashboard scroll container');
+    const before = main.scrollTop;
+    const max = main.scrollHeight - main.clientHeight;
+    const after = before + 64 <= max ? before + 64 : Math.max(0, before - 64);
+    main.scrollTop = after;
+    return { before, after };
+  });
+}
+
+test.describe('dashboard container scroll hydration (#5876)', () => {
+  for (const viewport of [
+    { label: 'desktop', width: 1280, height: 720 },
+    { label: 'mobile', width: 390, height: 844 },
+  ]) {
+    test(`${viewport.label} container scroll hydrates a panel-specific data path`, async ({ page }) => {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height });
+      await seedScrollableDashboard(page);
+      const stablecoinRequests = await installStablecoinContract(page);
+
+      await page.goto('/');
+      await page.waitForFunction(
+        () => document.documentElement.dataset.wmEventHandlersReady === 'true',
+      );
+
+      const main = page.locator('.main-content');
+      const stablecoins = page.locator('[data-panel="stablecoins"]');
+      await expect(main).toBeAttached();
+      await expect(stablecoins).toBeAttached();
+
+      const initial = await readScrollMetrics(page);
+      expect(initial.scrollHeight, '.main-content must genuinely overflow').toBeGreaterThan(
+        initial.clientHeight,
+      );
+      expect(initial.scrollTop, 'the test must start before any dashboard scroll').toBe(0);
+      expect(
+        initial.targetTop,
+        'stablecoins must start outside the 400px viewport hydration margin',
+      ).toBeGreaterThan(initial.viewportHeight + 400);
+      expect(
+        stablecoinRequests,
+        'the panel-specific request must be absent before scrolling',
+      ).toEqual([]);
+
+      await page.evaluate(() => {
+        const state = window as typeof window & { __wmDashboardScrollCount?: number };
+        state.__wmDashboardScrollCount = 0;
+        window.addEventListener('scroll', () => {
+          state.__wmDashboardScrollCount = (state.__wmDashboardScrollCount ?? 0) + 1;
+        }, { capture: true });
+      });
+
+      await scrollTargetIntoView(page);
+      await page.waitForFunction(
+        () => ((window as typeof window & { __wmDashboardScrollCount?: number })
+          .__wmDashboardScrollCount ?? 0) >= 1,
+      );
+
+      const afterFirstScroll = await readScrollMetrics(page);
+      expect(afterFirstScroll.scrollTop, '.main-content scrollTop must change').toBeGreaterThan(0);
+      expect(
+        afterFirstScroll.targetTop,
+        'the target panel must enter the viewport after the real container scroll',
+      ).toBeLessThan(afterFirstScroll.viewportHeight);
+
+      await page.waitForFunction(() => {
+        const target = document.querySelector('[data-panel="stablecoins"]');
+        return target instanceof HTMLElement && target.dataset.deferredPanel !== 'true';
+      });
+
+      const scrollCountBeforeSecond = await page.evaluate(
+        () => ((window as typeof window & { __wmDashboardScrollCount?: number })
+          .__wmDashboardScrollCount ?? 0),
+      );
+      const secondScroll = await scrollAgainAfterMount(page);
+      expect(secondScroll.after, 'the follow-up scroll must change scrollTop').not.toBe(
+        secondScroll.before,
+      );
+      await page.waitForFunction(
+        (minimum) => ((window as typeof window & { __wmDashboardScrollCount?: number })
+          .__wmDashboardScrollCount ?? 0) >= minimum,
+        scrollCountBeforeSecond + 1,
+      );
+
+      await expect.poll(
+        () => stablecoinRequests.length,
+        { message: 'scrolling must invoke primeVisiblePanelData for stablecoins' },
+      ).toBe(1);
+      await expect(stablecoins.locator('.stable-health')).toContainText('HEALTHY');
+      expect(stablecoinRequests).toHaveLength(1);
+    });
+  }
+});

@@ -35,6 +35,61 @@ function appDestroyBody() {
 }
 
 describe('App.destroy lifecycle cleanup contract', () => {
+  it('observes descendant scroll containers in capture phase and removes the matching listener', () => {
+    const scrollRegistrations = [
+      ...appSrc.matchAll(/window\.addEventListener\('scroll',\s*this\.handleViewportPrime,\s*\{([\s\S]*?)\}\);/g),
+    ];
+    assert.equal(scrollRegistrations.length, 1, 'App must register exactly one viewport-prime scroll listener');
+    assert.match(scrollRegistrations[0][1], /passive:\s*true/, 'the scroll listener must remain passive');
+    assert.match(
+      scrollRegistrations[0][1],
+      /capture:\s*true/,
+      'capture is required because element scroll events do not bubble to window',
+    );
+
+    const body = appDestroyBody();
+    assert.match(
+      body,
+      /window\.removeEventListener\('scroll',\s*this\.handleViewportPrime,\s*\{\s*capture:\s*true\s*\}\);/,
+      'destroy() must use the same capture value so same-document re-inits do not accumulate listeners',
+    );
+    assert.match(
+      appSrc,
+      /window\.addEventListener\('resize',\s*this\.handleViewportPrime\);/,
+      'viewport resize must keep triggering hydration',
+    );
+    assert.match(
+      body,
+      /window\.removeEventListener\('resize',\s*this\.handleViewportPrime\);/,
+      'destroy() must keep removing the resize listener',
+    );
+  });
+
+  it('coalesces viewport triggers and cancels queued hydration during destroy', () => {
+    const start = appSrc.indexOf('private readonly handleViewportPrime = (): void => {');
+    const end = appSrc.indexOf('private readonly handleConnectivityChange', start);
+    assert.notEqual(start, -1, 'could not locate handleViewportPrime');
+    assert.notEqual(end, -1, 'could not locate the end of handleViewportPrime');
+    const handler = appSrc.slice(start, end);
+
+    assert.match(
+      handler,
+      /if \(this\.visiblePanelPrimeRaf !== null\) return;/,
+      'repeated scrolls in one frame must share one hydration callback',
+    );
+    assert.match(handler, /this\.visiblePanelPrimeRaf = window\.requestAnimationFrame\(/);
+    assert.match(handler, /this\.visiblePanelPrimeRaf = null;/);
+    assert.match(handler, /void this\.primeVisiblePanelData\(\);/);
+    assert.match(handler, /void this\.dataLoader\.loadAllData\(\);/);
+
+    const body = appDestroyBody();
+    assert.match(
+      body,
+      /if \(this\.visiblePanelPrimeRaf !== null\) \{\s*window\.cancelAnimationFrame\(this\.visiblePanelPrimeRaf\);\s*this\.visiblePanelPrimeRaf = null;\s*\}/,
+      'destroy() must cancel a queued frame before it can hydrate a disposed App',
+    );
+  });
+
   it('stops background flight and loaded vessel runtime', () => {
     const body = appDestroyBody();
     for (const expected of [

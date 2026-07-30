@@ -1719,7 +1719,10 @@ export class App {
     // primeVisiblePanelData owns ETF, Stablecoins, Gulf Economies, etc. that
     // are NOT part of loadAllData. Running them in parallel prevents those
     // panels from being blocked when a loadAllData batch is slow.
-    window.addEventListener('scroll', this.handleViewportPrime, { passive: true });
+    window.addEventListener('scroll', this.handleViewportPrime, {
+      passive: true,
+      capture: true,
+    });
     window.addEventListener('resize', this.handleViewportPrime);
     // forceAll=false at bootstrap: data-loader's existing per-panel
     // viewport gate (shouldLoad(id) = forceAll || isPanelNearViewport(id))
@@ -1908,7 +1911,7 @@ export class App {
   public destroy(): void {
     this.state.isDestroyed = true;
     cancelBootstrapSlowTier();
-    window.removeEventListener('scroll', this.handleViewportPrime);
+    window.removeEventListener('scroll', this.handleViewportPrime, { capture: true });
     window.removeEventListener('resize', this.handleViewportPrime);
     window.removeEventListener('online', this.handleConnectivityChange);
     window.removeEventListener('offline', this.handleConnectivityChange);
