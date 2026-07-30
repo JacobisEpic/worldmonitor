@@ -8,6 +8,10 @@
  *  - Missing plan claim → defaults to 'free'
  *  - Small JWT clock skew → accepted within the bounded tolerance on both verification paths
  *  - Expired token beyond the tolerance → { valid: false, reason: 'invalid' }
+ *  - Not-yet-valid token within the nbf tolerance → accepted on both paths
+ *  - Exact exp/nbf tolerance boundaries → pinned with a fixed verification clock (no wall-clock coupling)
+ *  - Token with no exp claim → rejected (requiredClaims makes the stated bound enforced)
+ *  - Tolerance-only acceptance → surfaced via acceptedWithinClockTolerance
  *  - Invalid signature → { valid: false }
  *  - Allowed audiences → accepted ('convex' template plus configured publishable/audience envs)
  *  - Unexpected audience → rejected
@@ -18,7 +22,7 @@
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { describe, it, before, after } from 'node:test';
-import { generateKeyPair, exportJWK, SignJWT } from 'jose';
+import { generateKeyPair, exportJWK, jwtVerify, SignJWT } from 'jose';
 
 const EXPECTED_CLOCK_TOLERANCE_SECONDS = 5;
 
@@ -27,6 +31,7 @@ type AuthSessionResult = {
   userId?: string;
   role?: string;
   reason?: 'invalid' | 'unverifiable';
+  acceptedWithinClockTolerance?: true;
 };
 
 // ---------------------------------------------------------------------------
@@ -76,6 +81,11 @@ describe('validateBearerToken (with JWKS)', () => {
   let jwksPort: number;
   let validateBearerToken: (token: string) => Promise<AuthSessionResult>;
   let getClerkJwtVerifyOptions: () => { clockTolerance?: string | number };
+  let getClerkJwtVerifyBaseOptions: () => {
+    clockTolerance?: string | number;
+    requiredClaims?: string[];
+  };
+  let verifyPublicKey: CryptoKey;
   let originalClerkSecretKey: string | undefined;
 
   // Separate key pair for "wrong key" tests
@@ -85,6 +95,7 @@ describe('validateBearerToken (with JWKS)', () => {
     // Generate an RSA key pair for signing JWTs
     const { publicKey, privateKey: pk } = await generateKeyPair('RS256');
     privateKey = pk;
+    verifyPublicKey = publicKey;
 
     const { privateKey: wpk } = await generateKeyPair('RS256');
     wrongPrivateKey = wpk;
@@ -124,6 +135,7 @@ describe('validateBearerToken (with JWKS)', () => {
     const mod = await import(`../server/auth-session.ts?t=${Date.now()}`);
     validateBearerToken = mod.validateBearerToken;
     getClerkJwtVerifyOptions = mod.getClerkJwtVerifyOptions;
+    getClerkJwtVerifyBaseOptions = mod.getClerkJwtVerifyBaseOptions;
   });
 
   after(async () => {
@@ -145,6 +157,7 @@ describe('validateBearerToken (with JWKS)', () => {
       expiresAt?: number;
       expiresIn?: string;
       key?: CryptoKey;
+      notBeforeAt?: number;
     },
   ) {
     const builder = new SignJWT(claims)
@@ -155,6 +168,10 @@ describe('validateBearerToken (with JWKS)', () => {
 
     if (opts?.audience !== null) {
       builder.setAudience(opts?.audience ?? 'convex');
+    }
+
+    if (opts?.notBeforeAt !== undefined) {
+      builder.setNotBefore(opts.notBeforeAt);
     }
 
     if (opts?.expiresAt !== undefined) {
@@ -173,6 +190,13 @@ describe('validateBearerToken (with JWKS)', () => {
       getClerkJwtVerifyOptions().clockTolerance,
       EXPECTED_CLOCK_TOLERANCE_SECONDS,
     );
+    // The fallback (no-audience) path's options carry the same bound directly,
+    // and require `exp` so the bound is enforced rather than assumed.
+    assert.equal(
+      getClerkJwtVerifyBaseOptions().clockTolerance,
+      EXPECTED_CLOCK_TOLERANCE_SECONDS,
+    );
+    assert.deepEqual(getClerkJwtVerifyBaseOptions().requiredClaims, ['exp']);
   });
 
   it('accepts a valid Pro token', async () => {
@@ -181,6 +205,8 @@ describe('validateBearerToken (with JWKS)', () => {
     assert.equal(result.valid, true);
     assert.equal(result.userId, 'user_pro1');
     assert.equal(result.role, 'pro');
+    // A token with real life left was not admitted by the tolerance.
+    assert.equal(result.acceptedWithinClockTolerance, undefined);
   });
 
   it('accepts a valid Free token and normalizes role to free', async () => {
@@ -217,6 +243,9 @@ describe('validateBearerToken (with JWKS)', () => {
     const result = await validateBearerToken(token);
     assert.equal(result.valid, true);
     assert.equal(result.userId, 'user_aud_within_tolerance');
+    // Downstream consumers (api/user-prefs.ts) branch on this to classify a
+    // Convex re-verification 401 as expected near-expiry, not auth drift.
+    assert.equal(result.acceptedWithinClockTolerance, true);
   });
 
   it('rejects an audience-bearing token expired beyond the clock tolerance', async () => {
@@ -297,6 +326,7 @@ describe('validateBearerToken (with JWKS)', () => {
     assert.equal(result.valid, true);
     assert.equal(result.userId, 'user_noaud_within_tolerance');
     assert.equal(result.role, 'free');
+    assert.equal(result.acceptedWithinClockTolerance, true);
   });
 
   it('rejects a no-audience token expired beyond the clock tolerance', async () => {
@@ -310,6 +340,108 @@ describe('validateBearerToken (with JWKS)', () => {
       await validateBearerToken(token),
       { valid: false, reason: 'invalid' },
     );
+  });
+
+  it('accepts a not-yet-valid token within the nbf clock tolerance on both paths', async () => {
+    // Structurally flake-safe direction: nbf recedes into the past as real
+    // time advances, so test-runner delay can only help acceptance. The
+    // rejection side of the nbf boundary is pinned with a fixed clock below —
+    // a live-clock nbf rejection test would flip to a false pass within
+    // seconds, the flake class tracked in #5841.
+    const now = Math.floor(Date.now() / 1000);
+    const audToken = await signToken(
+      { sub: 'user_aud_nbf_within', plan: 'pro' },
+      { notBeforeAt: now + 4 },
+    );
+    const audResult = await validateBearerToken(audToken);
+    assert.equal(audResult.valid, true);
+    assert.equal(audResult.userId, 'user_aud_nbf_within');
+
+    const noAudToken = await signToken(
+      { sub: 'user_noaud_nbf_within' },
+      { audience: null, notBeforeAt: now + 4 },
+    );
+    const noAudResult = await validateBearerToken(noAudToken);
+    assert.equal(noAudResult.valid, true);
+    assert.equal(noAudResult.userId, 'user_noaud_nbf_within');
+    assert.equal(noAudResult.role, 'free');
+  });
+
+  it('rejects a token with no exp claim (requiredClaims enforces the stated bound)', async () => {
+    const token = await new SignJWT({ sub: 'user_no_exp', plan: 'pro' })
+      .setProtectedHeader({ alg: 'RS256', kid: 'test-key-1' })
+      .setIssuer(`http://127.0.0.1:${jwksPort}`)
+      .setAudience('convex')
+      .setSubject('user_no_exp')
+      .setIssuedAt()
+      .sign(privateKey);
+
+    assert.deepEqual(
+      await validateBearerToken(token),
+      { valid: false, reason: 'invalid' },
+    );
+  });
+
+  describe('exact tolerance boundaries (fixed verification clock)', () => {
+    // These pin the numeric bound behaviorally — a tolerance quietly widened
+    // to 6 or narrowed to 4 fails here — with zero wall-clock coupling:
+    // jose's `currentDate` option freezes "now", so elapsed runner time
+    // cannot flip an outcome. Verification runs against the same exported
+    // options objects the module passes to jwtVerify in production.
+    it('pins the exp boundary on the audience path: 4s late accepted, exactly 5s late rejected', async () => {
+      const t = Math.floor(Date.now() / 1000);
+      const currentDate = new Date(t * 1000);
+
+      const justInside = await signToken(
+        { sub: 'user_exp_edge_in', plan: 'pro' },
+        { expiresAt: t - (EXPECTED_CLOCK_TOLERANCE_SECONDS - 1) },
+      );
+      const { payload } = await jwtVerify(justInside, verifyPublicKey, {
+        ...getClerkJwtVerifyOptions(),
+        currentDate,
+      });
+      assert.equal(payload.sub, 'user_exp_edge_in');
+
+      const atBoundary = await signToken(
+        { sub: 'user_exp_edge_out', plan: 'pro' },
+        { expiresAt: t - EXPECTED_CLOCK_TOLERANCE_SECONDS },
+      );
+      await assert.rejects(
+        jwtVerify(atBoundary, verifyPublicKey, {
+          ...getClerkJwtVerifyOptions(),
+          currentDate,
+        }),
+        (err: { code?: string }) => err.code === 'ERR_JWT_EXPIRED',
+      );
+    });
+
+    it('pins the nbf boundary on the fallback path: exactly 5s early accepted, 6s early rejected', async () => {
+      const t = Math.floor(Date.now() / 1000);
+      const currentDate = new Date(t * 1000);
+
+      const atBoundary = await signToken(
+        { sub: 'user_nbf_edge_in' },
+        { audience: null, notBeforeAt: t + EXPECTED_CLOCK_TOLERANCE_SECONDS },
+      );
+      const { payload } = await jwtVerify(atBoundary, verifyPublicKey, {
+        ...getClerkJwtVerifyBaseOptions(),
+        currentDate,
+      });
+      assert.equal(payload.sub, 'user_nbf_edge_in');
+
+      const beyond = await signToken(
+        { sub: 'user_nbf_edge_out' },
+        { audience: null, notBeforeAt: t + EXPECTED_CLOCK_TOLERANCE_SECONDS + 1 },
+      );
+      await assert.rejects(
+        jwtVerify(beyond, verifyPublicKey, {
+          ...getClerkJwtVerifyBaseOptions(),
+          currentDate,
+        }),
+        (err: { code?: string; claim?: string }) =>
+          err.code === 'ERR_JWT_CLAIM_VALIDATION_FAILED' && err.claim === 'nbf',
+      );
+    });
   });
 
   it('extracts email and name from JWT for checkout prefill', async () => {
