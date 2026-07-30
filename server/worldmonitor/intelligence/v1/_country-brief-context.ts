@@ -14,6 +14,7 @@
 // server is simply the right place to do it once for everyone.
 
 import { getCachedJson } from '../../../_shared/redis';
+import { sanitizeForPromptLine } from '../../../_shared/llm-sanitize.js';
 
 const DIGEST_KEY_EN = 'news:digest:v1:full:en';
 const MAX_GROUNDING_ITEMS = 15;
@@ -208,7 +209,7 @@ export function buildSharedCountryContext(digest: unknown, countryCode: string):
   const sources = collectBriefSources(groundingItems);
   const sourceLines = sources.length > 0 ? ['Brief source articles:', ...briefSourceContextLines(sources)] : [];
   const headlineLines = groundingItems
-    .map((item) => (typeof item.title === 'string' ? item.title : ''))
+    .map((item) => sanitizeForPromptLine(item.title))
     .filter(Boolean);
   const contextSnapshot = [...sourceLines, 'Headlines:', ...headlineLines].join('\n').slice(0, MAX_CONTEXT_CHARS);
   return { contextSnapshot, sources };

@@ -13,7 +13,7 @@
  */
 
 import { WHY_MATTERS_ANALYST_SYSTEM_V2, briefDateLine } from '../../../../shared/brief-llm-core.js';
-import { sanitizeForPrompt } from '../../../_shared/llm-sanitize.js';
+import { sanitizeForPromptLine } from '../../../_shared/llm-sanitize.js';
 import type { BriefStoryContext } from './brief-story-context';
 
 export interface StoryForPrompt {
@@ -31,18 +31,19 @@ export interface StoryForPrompt {
  * Sanitize all untrusted string fields before interpolating into the
  * LLM prompt. Defense-in-depth: the endpoint is already
  * RELAY_SHARED_SECRET-gated, but repo convention applies
- * `sanitizeForPrompt` at every LLM boundary regardless of auth tier.
- * Strips role markers, instruction overrides, control chars, etc.
+ * `sanitizeForPromptLine` at every single-line LLM boundary regardless of
+ * auth tier. Strips role markers, instruction overrides, control chars, and
+ * line delimiters that could forge sibling fields.
  */
 export function sanitizeStoryFields(story: StoryForPrompt): StoryForPrompt {
   return {
-    headline: sanitizeForPrompt(story.headline),
-    source: sanitizeForPrompt(story.source),
-    threatLevel: sanitizeForPrompt(story.threatLevel),
-    category: sanitizeForPrompt(story.category),
-    country: sanitizeForPrompt(story.country),
+    headline: sanitizeForPromptLine(story.headline),
+    source: sanitizeForPromptLine(story.source),
+    threatLevel: sanitizeForPromptLine(story.threatLevel),
+    category: sanitizeForPromptLine(story.category),
+    country: sanitizeForPromptLine(story.country),
     ...(typeof story.description === 'string' && story.description.length > 0
-      ? { description: sanitizeForPrompt(story.description) }
+      ? { description: sanitizeForPromptLine(story.description) }
       : {}),
   };
 }
