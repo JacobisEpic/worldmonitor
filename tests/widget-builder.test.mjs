@@ -1369,12 +1369,15 @@ describe('PRO widget — store and sanitizer', () => {
       FakeEventTarget.prototype.addEventListener = (type, listener) => {
         listeners.set(type, listener);
       };
+      function FakeEvent() {}
+      FakeEvent.prototype.stopImmediatePropagation = () => {};
       const sandboxWindow = new FakeEventTarget();
       sandboxWindow.location = { hash: '#id=wm-1&token=test-token' };
       sandboxWindow.parent = parent;
       const context = {
         URL,
         URLSearchParams,
+        Event: FakeEvent,
         EventTarget: FakeEventTarget,
         document: {
           referrer,
@@ -1457,7 +1460,12 @@ describe('PRO widget — store and sanitizer', () => {
 
     function FakeEvent(type) {
       this.type = type;
+      this.immediatePropagationStopped = false;
     }
+
+    FakeEvent.prototype.stopImmediatePropagation = function () {
+      this.immediatePropagationStopped = true;
+    };
 
     function FakeEventTarget() {
       this.listeners = new Map();
@@ -1477,6 +1485,7 @@ describe('PRO widget — store and sanitizer', () => {
         } else {
           entry.listener.handleEvent.call(entry.listener, event);
         }
+        if (event.immediatePropagationStopped) break;
         if (entry.options?.once) {
           const current = this.listeners.get(event.type) ?? [];
           this.listeners.set(event.type, current.filter((candidate) => candidate !== entry));
@@ -1494,14 +1503,18 @@ describe('PRO widget — store and sanitizer', () => {
     let vmContext;
     const document = {
       referrer: 'https://worldmonitor.app/dashboard',
-      open() {},
+      open() {
+        // Real document.open() clears Window listeners. The guard must restore
+        // its stopper after this reset and before widget HTML begins parsing.
+        sandboxWindow.listeners.clear();
+      },
       write(html) {
         sandboxWindow.onbeforeunload = () => 'too late';
         sandboxWindow.addEventListener('beforeunload', () => {
           sandboxWindow.beforeUnloadCalls++;
         });
         guardedAtWrite = sandboxWindow.onbeforeunload === null
-          && (sandboxWindow.listeners.get('beforeunload')?.length ?? 0) === 0;
+          && (sandboxWindow.listeners.get('beforeunload')?.length ?? 0) === 1;
 
         for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/gi)) {
           vm.runInContext(match[1], vmContext);
@@ -1558,7 +1571,7 @@ window.dispatchEvent(new Event('click'));
     assert.equal(sandboxWindow.onbeforeunload, null, 'onbeforeunload assignments must remain inert');
     sandboxWindow.onbeforeunload = () => 'still blocked';
     assert.equal(sandboxWindow.onbeforeunload, null, 'ordinary reassignment must not restore onbeforeunload');
-    assert.equal(sandboxWindow.beforeUnloadCalls, 0, 'beforeunload listeners must not be registered');
+    assert.equal(sandboxWindow.beforeUnloadCalls, 0, 'the native stopper must block later beforeunload handlers');
     assert.equal(sandboxWindow.clickCalls, 1, 'listener objects and normal event options must still work');
   });
 
