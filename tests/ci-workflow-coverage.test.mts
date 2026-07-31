@@ -463,6 +463,15 @@ describe('CI workflow coverage', () => {
     );
   });
 
+  it('shares tracked edge bundle discovery with pre-push', () => {
+    const edgeBundleStep = workflowStepBlock(testWorkflow, 'Edge function bundle check');
+    assert.match(
+      edgeBundleStep,
+      /^\s+run: node scripts\/check-edge-function-bundles\.mjs\s*$/m,
+    );
+    assert.doesNotMatch(edgeBundleStep, /find api\//);
+  });
+
   it('keeps resilience validation bundle inputs in the CI change filter', () => {
     assert.ok(
       testWorkflow.includes('validation: ${{ steps.diff.outputs.validation }}'),
