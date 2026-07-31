@@ -518,9 +518,9 @@ Prediction markets: geopolitical/elections, tagged tech (AI/crypto/science), fin
 
 | Name | Type | Description |
 |------|------|-------------|
-| `category` | string: geopolitical / tech / finance | Restrict to one market category bucket. Omit for all three. `finance` also owns untagged non-geopolitical records. |
+| `category` | string: geopolitical / tech / finance | Restrict to one market category bucket. Omit for all three. Finance also owns untagged non-geopolitical records. |
 | `query` | string | Keep only markets whose title contains this text (case-insensitive). |
-| `source` | string: kalshi / polymarket | Filter to one prediction-market source. Kalshi currently provides no classifier tags, so combining `source=kalshi` with `category=tech` returns no records. |
+| `source` | string: kalshi / polymarket | Filter to one prediction-market source. Kalshi currently provides no classifier tags, so source=kalshi with category=tech returns no records. |
 | `limit` | number | Cap each category bucket to at most this many markets (default 30, pass 0 for no cap). |
 
 - **API endpoints:** `GET /api/prediction/v1/list-prediction-markets`
