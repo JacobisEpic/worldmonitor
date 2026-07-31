@@ -53,8 +53,8 @@ function assertEnglishCategoryMeaning(text, label) {
   }
   assert.match(
     text,
-    /geopolitical[^.]*geopolitic[^.]*election/i,
-    `${label} does not associate geopolitical with geopolitics and elections`,
+    /geopolitical[^.]*election/i,
+    `${label} does not associate geopolitical with elections`,
   );
   assert.match(
     text,
@@ -63,8 +63,8 @@ function assertEnglishCategoryMeaning(text, label) {
   );
   assert.match(
     text,
-    /finance[^.]*financial[^.]*economic/i,
-    `${label} does not associate finance with financial and economic markets`,
+    /finance[^.]*econom(?:ic|ics)[^.]*fallback/i,
+    `${label} does not associate finance/economics with the fallback`,
   );
 }
 
@@ -83,8 +83,9 @@ describe('get_prediction_markets agent-facing category contract', () => {
     assert.ok(tool, `${TOOL_NAME} must be registered`);
     assert.deepEqual(tool.inputSchema.properties.category.enum, EXPECTED_CATEGORIES);
     assertEnglishCategoryMeaning(tool.description, 'registry description');
-    assert.match(tool.description, /classifier tags/i);
-    assert.match(tool.description, /coverage varies by venue/i);
+    assert.match(tool.description, /Kalshi currently supplies no classifier tags/i);
+    assert.match(tool.description, /source=kalshi[^.]*category=tech[^.]*returns no records/i);
+    assert.match(tool.description, /fall back to finance/i);
     assert.doesNotMatch(
       tool.description,
       /Polymarket/i,
@@ -94,6 +95,16 @@ describe('get_prediction_markets agent-facing category contract', () => {
       tool.inputSchema.properties.category.description,
       /Omit for all three/i,
       'the category schema must preserve omission as all pools',
+    );
+    assert.match(
+      tool.inputSchema.properties.category.description,
+      /Finance also owns untagged non-geopolitical records/i,
+      'the category schema must expose the finance fallback',
+    );
+    assert.match(
+      tool.inputSchema.properties.source.description,
+      /Kalshi[^.]*no classifier tags[^.]*source=kalshi[^.]*category=tech[^.]*returns no records/i,
+      'the source schema must expose the Kalshi tech limitation',
     );
     assertNoGeopoliticalDefault(tool.description, 'registry description');
 
@@ -122,7 +133,13 @@ describe('get_prediction_markets agent-facing category contract', () => {
       'tools/list description must stay within the registry compression budget',
     );
     assertEnglishCategoryMeaning(publicTool.description, 'tools/list description');
+    assert.match(publicTool.description, /untagged fallback/i);
     assertNoGeopoliticalDefault(publicTool.description, 'tools/list description');
+    assert.match(
+      publicTool.inputSchema.properties.source.description,
+      /Kalshi[^.]*source=kalshi[^.]*category=tech[^.]*returns no records/i,
+      'tools/list source metadata must expose the Kalshi tech limitation',
+    );
   });
 
   it('keeps generated public server-card metadata equal to the canonical registry', () => {
@@ -139,6 +156,8 @@ describe('get_prediction_markets agent-facing category contract', () => {
     );
     assertEnglishCategoryMeaning(section, 'English reference');
     assert.match(section, /Omit for all three/i);
+    assert.match(section, /source=kalshi[^.]*category=tech[^.]*returns no records/i);
+    assert.match(section, /fall back to finance/i);
     assertNoGeopoliticalDefault(section, 'English reference');
   });
 
@@ -158,17 +177,21 @@ describe('get_prediction_markets agent-facing category contract', () => {
       '金融',
       '经济',
       '分类器标签',
-      '交易平台',
+      '未分类',
+      '回退',
+      'Kalshi',
     ]) {
       assert.ok(section.includes(term), `Chinese reference omits ${term}`);
     }
     assert.doesNotMatch(section, /Active prediction markets:/);
     assert.match(section, /省略则返回全部三类/);
+    assert.match(section, /`source=kalshi` 与 `category=tech` 组合不会返回记录/);
   });
 
   it('keeps both overview rows concise without contradicting the detailed contract', () => {
     const englishRow = overviewRow(englishOverview);
     assertEnglishCategoryMeaning(englishRow, 'English overview');
+    assert.match(englishRow, /untagged fallback/i);
     assertNoGeopoliticalDefault(englishRow, 'English overview');
     assert.doesNotMatch(englishRow, /Polymarket/i);
 
@@ -176,7 +199,7 @@ describe('get_prediction_markets agent-facing category contract', () => {
     for (const category of EXPECTED_CATEGORIES) {
       assert.match(chineseRow, new RegExp(`\`${category}\``), `Chinese overview omits ${category}`);
     }
-    for (const term of ['地缘政治', '选举', '科技', '人工智能', '加密货币', '科学', '金融', '经济']) {
+    for (const term of ['地缘政治', '选举', '人工智能', '加密货币', '科学', '金融', '经济', '未分类', '回退']) {
       assert.ok(chineseRow.includes(term), `Chinese overview omits ${term}`);
     }
     assert.doesNotMatch(chineseRow, /Polymarket/i);
