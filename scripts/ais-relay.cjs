@@ -21,18 +21,30 @@ const zlib = require('zlib');
 const path = require('path');
 const { readFileSync } = require('fs');
 const { execFile } = require('child_process');
-const { promisify } = require('util');
-const execFileAsync = promisify(execFile);
 const crypto = require('crypto');
 const v8 = require('v8');
 const { WebSocketServer, WebSocket } = require('ws');
 const { parseProxyConfig, resolveProxyString } = require('./_proxy-utils.cjs');
+const {
+  YahooQuoteSummaryClient,
+  buildSectorSeedMeta,
+  buildSectorValuationCoverage,
+  buildSectorValuationPublication,
+  collectSectorValuations,
+} = require('./_yahoo-sector-valuations.cjs');
 const { countryNameToIso2 } = require('./shared/country-name-to-iso2.cjs');
 const {
   buildDedupMaterial,
   classifySetNxResult,
   recordDedupOutcome,
 } = require('./shared/notification-dedup.cjs');
+const {
+  AVIATION_MIN_SERVED_COVERAGE,
+  RSS_MIN_SERVED_COVERAGE,
+  classifyUpstreamOutcome,
+  nextBackoffMs,
+  summarizeServedCoverage,
+} = require('./_ingestion-coverage.cjs');
 const { maintainClosedMarketEquityKeys: maintainClosedMarketEquityKeysWithDeps } = require('./shared/closed-market-equity-maintenance.cjs');
 const { getUsEquitySession, isMultiMarketEquityTradingDay } = require('./shared/market-hours.cjs');
 const { mergeLastGoodQuotes, planYahooRefresh } = require('./shared/market-quote-refresh.cjs');
@@ -55,6 +67,7 @@ console.log(`[Relay] Heap limit: ${(_heapStats.heap_size_limit / 1024 / 1024).to
 const AISSTREAM_URL = 'wss://stream.aisstream.io/v0/stream';
 const API_KEY = process.env.AISSTREAM_API_KEY || process.env.VITE_AISSTREAM_API_KEY;
 const PORT = process.env.PORT || 3004;
+const RELAY_TEST_MODE = process.env.RELAY_TEST_MODE === 'true';
 
 if (!API_KEY) {
   console.warn('[Relay] AIS disabled: AISSTREAM_API_KEY is not set (other relay and seed services remain available)');
@@ -103,6 +116,8 @@ const RELAY_OPENSKY_RATE_LIMIT_MAX = Number.isFinite(Number(process.env.RELAY_OP
   ? Number(process.env.RELAY_OPENSKY_RATE_LIMIT_MAX) : 600;
 const RELAY_RSS_RATE_LIMIT_MAX = Number.isFinite(Number(process.env.RELAY_RSS_RATE_LIMIT_MAX))
   ? Number(process.env.RELAY_RSS_RATE_LIMIT_MAX) : 300;
+const RELAY_GOOGLE_FLIGHTS_RATE_LIMIT_MAX = Number.isFinite(Number(process.env.RELAY_GOOGLE_FLIGHTS_RATE_LIMIT_MAX))
+  ? Number(process.env.RELAY_GOOGLE_FLIGHTS_RATE_LIMIT_MAX) : 60;
 const RELAY_LOG_THROTTLE_MS = Math.max(1000, Number(process.env.RELAY_LOG_THROTTLE_MS || 10000));
 const ALLOW_VERCEL_PREVIEW_ORIGINS = process.env.ALLOW_VERCEL_PREVIEW_ORIGINS === 'true';
 
@@ -670,6 +685,11 @@ async function publishNotificationEvent({ eventType, payload, severity, variant,
 }
 
 let upstreamSocket = null;
+let upstreamReconnectTimer = null;
+let upstreamReconnectFailures = 0;
+let relayShuttingDown = false;
+const AIS_RECONNECT_BASE_MS = 5_000;
+const AIS_RECONNECT_MAX_MS = 5 * 60 * 1000;
 let upstreamPaused = false;
 let upstreamQueue = [];
 let upstreamQueueReadIndex = 0;
@@ -2022,8 +2042,6 @@ function _parseYahooChartJson(body) {
 const _YAHOO_PROXY_COOLDOWN_MS = 5 * 60 * 1000;
 let _yahooConnectProxyFailCount = 0;   // fetchYahooChartDirect via gate.decodo.com (CONNECT)
 let _yahooConnectProxyCooldownUntil = 0;
-let _yahooCurlProxyFailCount = 0;      // fetchYahooQuoteSummary via us.decodo.com (curl)
-let _yahooCurlProxyCooldownUntil = 0;
 
 function _fetchYahooChartNoProxy(symbol, query = '') {
   return new Promise((resolve) => {
@@ -2069,113 +2087,24 @@ function fetchYahooChartDirect(symbol, query = '') {
   });
 }
 
-// Yahoo's /v10 quoteSummary 401s on Railway container IPs (seen 2026-04-16
-// logs — all 12 sector ETFs failing). Direct first, then curl via Decodo
-// us.decodo.com. Must be curl (NOT CONNECT): Yahoo's edge blocks Decodo's
-// CONNECT egress (gate.decodo.com) but accepts the curl egress — probed
-// 2026-04-16, see scripts/_yahoo-fetch.mjs header.
-function fetchYahooQuoteSummary(symbol) {
-  return new Promise((resolve) => {
-    const modules = 'summaryDetail,defaultKeyStatistics';
-    const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${modules}`;
-    let settled = false;
-    const settle = (value) => { if (settled) return; settled = true; resolve(value); };
-    const req = https.get(url, {
-      headers: { 'User-Agent': CHROME_UA, Accept: 'application/json' },
-      timeout: 12000,
-    }, (resp) => {
-      if (resp.statusCode !== 200) {
-        resp.resume();
-        logThrottled('warn', `yahoo-summary-${resp.statusCode}:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} HTTP ${resp.statusCode}`);
-        return settle(_yahooQuoteSummaryProxyFallback(symbol, url));
-      }
-      let body = '';
-      resp.on('data', (chunk) => { body += chunk; });
-      resp.on('end', () => {
-        try {
-          const data = JSON.parse(body);
-          const result = data?.quoteSummary?.result?.[0];
-          if (!result) return settle(null); // app-level "no data" — proxy won't change it
-          const sd = result.summaryDetail || {};
-          const ks = result.defaultKeyStatistics || {};
-          const raw = (obj) => typeof obj === 'object' && obj !== null ? (obj.raw ?? obj.fmt ?? null) : (typeof obj === 'number' ? obj : null);
-          settle({
-            trailingPE: raw(sd.trailingPE),
-            forwardPE: raw(sd.forwardPE),
-            beta: raw(sd.beta) ?? raw(ks.beta3Year),
-            ytdReturn: raw(ks.ytdReturn),
-            threeYearReturn: raw(ks.threeYearAverageReturn),
-            fiveYearReturn: raw(ks.fiveYearAverageReturn),
-          });
-        } catch { settle(_yahooQuoteSummaryProxyFallback(symbol, url)); }
-      });
-    });
-    req.on('error', (err) => { if (settled) return; logThrottled('warn', `yahoo-summary-err:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} error: ${err.message}`); settle(_yahooQuoteSummaryProxyFallback(symbol, url)); });
-    req.on('timeout', () => { if (settled) return; req.destroy(); logThrottled('warn', `yahoo-summary-timeout:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} timeout`); settle(_yahooQuoteSummaryProxyFallback(symbol, url)); });
-  });
-}
+// Yahoo quoteSummary now requires a cookie + crumb session. The client caches
+// that session, refreshes it once on 401, then cools the whole route down so a
+// single auth failure cannot produce 12 direct + 12 proxy retries per cycle.
+// The Decodo fallback performs the same authenticated handshake through curl;
+// proxy credentials remain process-local and are never included in logs.
+const _yahooQuoteSummaryClient = new YahooQuoteSummaryClient({
+  userAgent: CHROME_UA,
+  resolveProxyString,
+  cooldownMs: _YAHOO_PROXY_COOLDOWN_MS,
+  logger: {
+    warn(message, { transport }) {
+      logThrottled('warn', `sector-yahoo-auth-${transport}`, message);
+    },
+  },
+});
 
-// Async so the curl call doesn't block the relay event loop. Returns a
-// Promise; resolve(promise) in the caller chains the Promise state through
-// to fetchYahooQuoteSummary's outer Promise, so awaiting fetchYahoo* in
-// seedSectorSummary yields the event loop during the curl round-trip.
-async function _yahooQuoteSummaryProxyFallback(symbol, url) {
-  const proxyAuth = resolveProxyString();
-  if (!proxyAuth) return null;
-  if (Date.now() < _yahooCurlProxyCooldownUntil) return null;
-  // Transport failures (timeout, proxy-connect refused, garbage body) must
-  // tick the cooldown too — the failure mode this PR hardens against would
-  // otherwise thrash through N curl attempts per tick with no backoff.
-  const bumpCooldown = () => {
-    _yahooCurlProxyFailCount++;
-    if (_yahooCurlProxyFailCount >= 5) {
-      _yahooCurlProxyCooldownUntil = Date.now() + _YAHOO_PROXY_COOLDOWN_MS;
-      _yahooCurlProxyFailCount = 0;
-      logThrottled('warn', 'sector-yahoo-proxy-cooldown', '[Sector] Yahoo curl proxy cooldown 5min after 5 failures');
-    }
-  };
-  try {
-    const args = [
-      '-sS', '--compressed', '--max-time', '15', '-L',
-      '-x', `http://${proxyAuth}`,
-      '-H', `User-Agent: ${CHROME_UA}`,
-      '-H', 'Accept: application/json',
-      '-w', '\n%{http_code}',
-      url,
-    ];
-    const { stdout } = await execFileAsync('curl', args, { encoding: 'utf8', timeout: 20000 });
-    const nl = stdout.lastIndexOf('\n');
-    const status = parseInt(stdout.slice(nl + 1).trim(), 10);
-    if (status < 200 || status >= 300) {
-      bumpCooldown();
-      logThrottled('warn', `sector-yahoo-proxy-${status}:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} proxy HTTP ${status}`);
-      return null;
-    }
-    const data = JSON.parse(stdout.slice(0, nl));
-    const result = data?.quoteSummary?.result?.[0];
-    if (!result) {
-      // Proxy reached Yahoo and got a valid 200 — route is healthy. Reset
-      // the counter even if this specific symbol has no data.
-      _yahooCurlProxyFailCount = 0;
-      return null;
-    }
-    _yahooCurlProxyFailCount = 0;
-    const sd = result.summaryDetail || {};
-    const ks = result.defaultKeyStatistics || {};
-    const raw = (obj) => typeof obj === 'object' && obj !== null ? (obj.raw ?? obj.fmt ?? null) : (typeof obj === 'number' ? obj : null);
-    return {
-      trailingPE: raw(sd.trailingPE),
-      forwardPE: raw(sd.forwardPE),
-      beta: raw(sd.beta) ?? raw(ks.beta3Year),
-      ytdReturn: raw(ks.ytdReturn),
-      threeYearReturn: raw(ks.threeYearAverageReturn),
-      fiveYearReturn: raw(ks.fiveYearAverageReturn),
-    };
-  } catch (err) {
-    bumpCooldown();
-    logThrottled('warn', `sector-yahoo-proxy-err:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} proxy error: ${err.message}`);
-    return null;
-  }
+function fetchYahooQuoteSummary(symbol) {
+  return _yahooQuoteSummaryClient.fetch(symbol);
 }
 
 function parseSectorValuation(raw) {
@@ -2428,16 +2357,42 @@ async function seedSectorSummary() {
     return 0;
   }
 
-  const valuations = {};
-  let valCount = 0;
-  for (const s of SECTOR_SYMBOLS) {
-    const raw = await fetchYahooQuoteSummary(s);
-    const parsed = parseSectorValuation(raw);
-    if (parsed) { valuations[s] = parsed; valCount++; }
-    await sleep(150);
-  }
+  const {
+    valuations,
+    valuationSources,
+    valuationCount: valCount,
+    unavailableSymbols,
+    valuationDiagnostics,
+    lastGoodFetchedAt,
+    lastGoodMetricsUsed,
+  } = await collectSectorValuations({
+    symbols: SECTOR_SYMBOLS,
+    fetchValue: fetchYahooQuoteSummary,
+    fetchValueDetailed: (symbol, options) => _yahooQuoteSummaryClient.fetchDetailed(symbol, options),
+    parseValue: parseSectorValuation,
+    sleepFn: sleep,
+    v7UserAgent: CHROME_UA,
+    v7ResolveProxyString: resolveProxyString,
+    v7Client: _yahooQuoteSummaryClient,
+    upstashGet,
+    upstashSet,
+  });
 
-  const payload = { sectors, valuations };
+  const valuationCoverage = buildSectorValuationCoverage({
+    valuationCount: valCount,
+    expectedCount: SECTOR_SYMBOLS.length,
+    fetchedAt: Date.now(),
+    sources: valuationSources,
+    unavailableSymbols,
+    valuationDiagnostics,
+    lastGoodFetchedAt,
+    lastGoodMetricsUsed,
+  });
+  const { payload, meta: sectorMeta } = buildSectorValuationPublication({
+    sectors,
+    valuations,
+    valuationCoverage,
+  });
   const ok = await envelopeWrite('market:sectors:v2', payload, MARKET_SEED_TTL, { recordCount: sectors.length, sourceVersion: 'market-sectors' });
   const quotesKey = `market:quotes:v1:${[...SECTOR_SYMBOLS].sort().join(',')}`;
   const sectorQuotes = sectors.map((s) => ({
@@ -2446,8 +2401,9 @@ async function seedSectorSummary() {
   }));
   const quotesPayload = { quotes: sectorQuotes, finnhubSkipped: false, skipReason: '', rateLimited: false };
   const ok2 = await envelopeWrite(quotesKey, quotesPayload, MARKET_SEED_TTL, { recordCount: sectorQuotes.length, sourceVersion: 'market-sectors' });
-  const ok3 = await upstashSet('seed-meta:market:sectors', { fetchedAt: Date.now(), recordCount: sectors.length }, 604800);
-  console.log(`[Market] Seeded ${sectors.length}/${SECTOR_SYMBOLS.length} sectors, ${valCount} valuations (redis: ${ok && ok2 && ok3 ? 'OK' : 'PARTIAL'})`);
+  const persistedSectorMeta = buildSectorSeedMeta(sectorMeta, ok);
+  const ok3 = await upstashSet('seed-meta:market:sectors', persistedSectorMeta, 604800);
+  console.log(`[Market] Seeded ${sectors.length}/${SECTOR_SYMBOLS.length} sectors, ${valCount}/${SECTOR_SYMBOLS.length} valuations (${valuationCoverage.sourceStatus}; redis: ${ok && ok2 && ok3 ? 'OK' : 'PARTIAL'})`);
   return sectors.length;
 }
 
@@ -6743,6 +6699,7 @@ function getRouteGroup(pathname) {
   if (pathname.startsWith('/wingbits/track')) return 'wingbits';
   if (pathname.startsWith('/opensky')) return 'opensky';
   if (pathname.startsWith('/rss')) return 'rss';
+  if (pathname.startsWith('/google-flights')) return 'google-flights';
   if (pathname.startsWith('/ais/snapshot')) return 'snapshot';
   if (pathname.startsWith('/worldbank')) return 'worldbank';
   if (pathname.startsWith('/polymarket')) return 'polymarket';
@@ -6757,6 +6714,7 @@ function getRouteGroup(pathname) {
 function getRateLimitForPath(pathname) {
   if (pathname.startsWith('/opensky')) return RELAY_OPENSKY_RATE_LIMIT_MAX;
   if (pathname.startsWith('/rss')) return RELAY_RSS_RATE_LIMIT_MAX;
+  if (pathname.startsWith('/google-flights')) return RELAY_GOOGLE_FLIGHTS_RATE_LIMIT_MAX;
   if (pathname.startsWith('/oref')) return RELAY_OREF_RATE_LIMIT_MAX;
   return RELAY_RATE_LIMIT_MAX;
 }
@@ -6804,10 +6762,43 @@ const relayMetricsLifetime = {
   openskyDedupEmpty: 0,
   openskyMiss: 0,
   openskyUpstreamFetches: 0,
+  openskyServed: 0,
+  openskySuccess: 0,
+  openskyThrottle: 0,
+  openskyTimeout: 0,
+  openskyAuthRejection: 0,
+  openskyFallback: 0,
+  openskyTerminalFailure: 0,
   drops: 0,
   notificationDedupSetNxErrors: 0,
   notificationDedupSetNxFailOpen: 0,
   notificationDedupSetNxFailClosed: 0,
+  googleFlightsRequests: 0,
+  googleFlightsServed: 0,
+  googleFlightsSuccess: 0,
+  googleFlights429: 0,
+  googleFlightsThrottle: 0,
+  googleFlightsTimeout: 0,
+  googleFlightsAuthRejection: 0,
+  googleFlightsFallback: 0,
+  googleFlightsTerminalFailure: 0,
+  rssRequests: 0,
+  rssServed: 0,
+  rssSuccess: 0,
+  rssThrottle: 0,
+  rssTimeout: 0,
+  rssAuthRejection: 0,
+  rssFallback: 0,
+  rssTerminalFailure: 0,
+  aisSnapshotRequests: 0,
+  aisSnapshotServed: 0,
+  aisSnapshotSuccess: 0,
+  aisSnapshotThrottle: 0,
+  aisSnapshotTimeout: 0,
+  aisSnapshotAuthRejection: 0,
+  aisSnapshotUnauthorizedClient: 0,
+  aisSnapshotFallback: 0,
+  aisSnapshotTerminalFailure: 0,
 };
 let relayMetricsQueueMaxLifetime = 0;
 let relayMetricsCurrentSec = 0;
@@ -6824,11 +6815,44 @@ function createRelayMetricsBucket() {
     openskyDedupEmpty: 0,
     openskyMiss: 0,
     openskyUpstreamFetches: 0,
+    openskyServed: 0,
+    openskySuccess: 0,
+    openskyThrottle: 0,
+    openskyTimeout: 0,
+    openskyAuthRejection: 0,
+    openskyFallback: 0,
+    openskyTerminalFailure: 0,
     drops: 0,
     notificationDedupSetNxErrors: 0,
     notificationDedupSetNxFailOpen: 0,
     notificationDedupSetNxFailClosed: 0,
     queueMax: 0,
+    googleFlightsRequests: 0,
+    googleFlightsServed: 0,
+    googleFlightsSuccess: 0,
+    googleFlights429: 0,
+    googleFlightsThrottle: 0,
+    googleFlightsTimeout: 0,
+    googleFlightsAuthRejection: 0,
+    googleFlightsFallback: 0,
+    googleFlightsTerminalFailure: 0,
+    rssRequests: 0,
+    rssServed: 0,
+    rssSuccess: 0,
+    rssThrottle: 0,
+    rssTimeout: 0,
+    rssAuthRejection: 0,
+    rssFallback: 0,
+    rssTerminalFailure: 0,
+    aisSnapshotRequests: 0,
+    aisSnapshotServed: 0,
+    aisSnapshotSuccess: 0,
+    aisSnapshotThrottle: 0,
+    aisSnapshotTimeout: 0,
+    aisSnapshotAuthRejection: 0,
+    aisSnapshotUnauthorizedClient: 0,
+    aisSnapshotFallback: 0,
+    aisSnapshotTerminalFailure: 0,
   };
 }
 
@@ -6875,6 +6899,47 @@ function incrementRelayMetric(field, amount = 1) {
   }
 }
 
+const RELAY_OUTCOME_FIELDS = Object.freeze({
+  opensky: Object.freeze({
+    success: 'openskySuccess',
+    throttle: 'openskyThrottle',
+    timeout: 'openskyTimeout',
+    authRejection: 'openskyAuthRejection',
+    fallback: 'openskyFallback',
+    terminalFailure: 'openskyTerminalFailure',
+  }),
+  googleFlights: Object.freeze({
+    success: 'googleFlightsSuccess',
+    throttle: 'googleFlightsThrottle',
+    timeout: 'googleFlightsTimeout',
+    authRejection: 'googleFlightsAuthRejection',
+    fallback: 'googleFlightsFallback',
+    terminalFailure: 'googleFlightsTerminalFailure',
+  }),
+  rss: Object.freeze({
+    success: 'rssSuccess',
+    throttle: 'rssThrottle',
+    timeout: 'rssTimeout',
+    authRejection: 'rssAuthRejection',
+    fallback: 'rssFallback',
+    terminalFailure: 'rssTerminalFailure',
+  }),
+  aisSnapshot: Object.freeze({
+    success: 'aisSnapshotSuccess',
+    throttle: 'aisSnapshotThrottle',
+    timeout: 'aisSnapshotTimeout',
+    authRejection: 'aisSnapshotAuthRejection',
+    fallback: 'aisSnapshotFallback',
+    terminalFailure: 'aisSnapshotTerminalFailure',
+  }),
+});
+
+function recordRelayOutcome(route, outcome, amount = 1) {
+  const metricField = RELAY_OUTCOME_FIELDS[route]?.[outcome];
+  if (!metricField) return;
+  incrementRelayMetric(metricField, amount);
+}
+
 function sampleRelayQueueSize(queueSize) {
   const bucket = getRelayMetricsBucket();
   if (queueSize > bucket.queueMax) bucket.queueMax = queueSize;
@@ -6902,15 +6967,78 @@ function getRelayRollingMetrics() {
     rollup.openskyDedupEmpty += bucket.openskyDedupEmpty;
     rollup.openskyMiss += bucket.openskyMiss;
     rollup.openskyUpstreamFetches += bucket.openskyUpstreamFetches;
+    rollup.openskyServed += bucket.openskyServed;
+    rollup.openskySuccess += bucket.openskySuccess;
+    rollup.openskyThrottle += bucket.openskyThrottle;
+    rollup.openskyTimeout += bucket.openskyTimeout;
+    rollup.openskyAuthRejection += bucket.openskyAuthRejection;
+    rollup.openskyFallback += bucket.openskyFallback;
+    rollup.openskyTerminalFailure += bucket.openskyTerminalFailure;
     rollup.drops += bucket.drops;
     rollup.notificationDedupSetNxErrors += bucket.notificationDedupSetNxErrors;
     rollup.notificationDedupSetNxFailOpen += bucket.notificationDedupSetNxFailOpen;
     rollup.notificationDedupSetNxFailClosed += bucket.notificationDedupSetNxFailClosed;
+    rollup.googleFlightsRequests += bucket.googleFlightsRequests;
+    rollup.googleFlightsServed += bucket.googleFlightsServed;
+    rollup.googleFlightsSuccess += bucket.googleFlightsSuccess;
+    rollup.googleFlights429 += bucket.googleFlights429;
+    rollup.googleFlightsThrottle += bucket.googleFlightsThrottle;
+    rollup.googleFlightsTimeout += bucket.googleFlightsTimeout;
+    rollup.googleFlightsAuthRejection += bucket.googleFlightsAuthRejection;
+    rollup.googleFlightsFallback += bucket.googleFlightsFallback;
+    rollup.googleFlightsTerminalFailure += bucket.googleFlightsTerminalFailure;
+    rollup.rssRequests += bucket.rssRequests;
+    rollup.rssServed += bucket.rssServed;
+    rollup.rssSuccess += bucket.rssSuccess;
+    rollup.rssThrottle += bucket.rssThrottle;
+    rollup.rssTimeout += bucket.rssTimeout;
+    rollup.rssAuthRejection += bucket.rssAuthRejection;
+    rollup.rssFallback += bucket.rssFallback;
+    rollup.rssTerminalFailure += bucket.rssTerminalFailure;
+    rollup.aisSnapshotRequests += bucket.aisSnapshotRequests;
+    rollup.aisSnapshotServed += bucket.aisSnapshotServed;
+    rollup.aisSnapshotSuccess += bucket.aisSnapshotSuccess;
+    rollup.aisSnapshotThrottle += bucket.aisSnapshotThrottle;
+    rollup.aisSnapshotTimeout += bucket.aisSnapshotTimeout;
+    rollup.aisSnapshotAuthRejection += bucket.aisSnapshotAuthRejection;
+    rollup.aisSnapshotUnauthorizedClient += bucket.aisSnapshotUnauthorizedClient;
+    rollup.aisSnapshotFallback += bucket.aisSnapshotFallback;
+    rollup.aisSnapshotTerminalFailure += bucket.aisSnapshotTerminalFailure;
     if (bucket.queueMax > rollup.queueMax) rollup.queueMax = bucket.queueMax;
   }
 
   const dedupCount = rollup.openskyDedup + rollup.openskyDedupNeg + rollup.openskyDedupEmpty;
   const cacheServedCount = rollup.openskyCacheHit + rollup.openskyNegativeHit + dedupCount;
+  const openskyCoverage = summarizeServedCoverage({
+    requests: rollup.openskyRequests,
+    served: rollup.openskyServed,
+    minimum: AVIATION_MIN_SERVED_COVERAGE,
+  });
+  const googleFlightsCoverage = summarizeServedCoverage({
+    requests: rollup.googleFlightsRequests,
+    served: rollup.googleFlightsServed,
+    minimum: AVIATION_MIN_SERVED_COVERAGE,
+  });
+  const aviationCoverage = summarizeServedCoverage({
+    requests: rollup.openskyRequests + rollup.googleFlightsRequests,
+    served: rollup.openskyServed + rollup.googleFlightsServed,
+    minimum: AVIATION_MIN_SERVED_COVERAGE,
+  });
+  const rssCoverage = summarizeServedCoverage({
+    requests: rollup.rssRequests,
+    served: rollup.rssServed,
+    minimum: RSS_MIN_SERVED_COVERAGE,
+  });
+  let rssBackoffActive = 0;
+  let rssMaxBackoffRemainingMs = 0;
+  const nowMs = Date.now();
+  for (const expiry of rssBackoffUntil.values()) {
+    const remaining = Math.max(0, expiry - nowMs);
+    if (remaining > 0) {
+      rssBackoffActive++;
+      rssMaxBackoffRemainingMs = Math.max(rssMaxBackoffRemainingMs, remaining);
+    }
+  }
 
   return {
     windowSeconds: METRICS_WINDOW_SECONDS,
@@ -6924,6 +7052,14 @@ function getRelayRollingMetrics() {
       dedupHits: dedupCount,
       misses: rollup.openskyMiss,
       upstreamFetches: rollup.openskyUpstreamFetches,
+      success: rollup.openskySuccess,
+      throttle: rollup.openskyThrottle,
+      timeout: rollup.openskyTimeout,
+      authRejection: rollup.openskyAuthRejection,
+      fallback: rollup.openskyFallback,
+      terminalFailure: rollup.openskyTerminalFailure,
+      served: rollup.openskyServed,
+      coverage: openskyCoverage,
       global429CooldownRemainingMs: Math.max(0, openskyGlobal429Until - Date.now()),
       requestSpacingMs: OPENSKY_REQUEST_SPACING_MS,
     },
@@ -6939,6 +7075,47 @@ function getRelayRollingMetrics() {
       dedupSetNxFailOpen: rollup.notificationDedupSetNxFailOpen,
       dedupSetNxFailClosed: rollup.notificationDedupSetNxFailClosed,
     },
+    aviation: {
+      coverage: aviationCoverage,
+      minimumServedCoverage: AVIATION_MIN_SERVED_COVERAGE,
+    },
+    googleFlights: {
+      requests: rollup.googleFlightsRequests,
+      served: rollup.googleFlightsServed,
+      success: rollup.googleFlightsSuccess,
+      throttle429: rollup.googleFlights429,
+      throttle: rollup.googleFlightsThrottle,
+      timeout: rollup.googleFlightsTimeout,
+      authRejection: rollup.googleFlightsAuthRejection,
+      fallback: rollup.googleFlightsFallback,
+      terminalFailure: rollup.googleFlightsTerminalFailure,
+      coverage: googleFlightsCoverage,
+      cooldownRemainingMs: Math.max(0, gfGlobal429Until - Date.now()),
+    },
+    rss: {
+      requests: rollup.rssRequests,
+      served: rollup.rssServed,
+      success: rollup.rssSuccess,
+      throttle: rollup.rssThrottle,
+      timeout: rollup.rssTimeout,
+      authRejection: rollup.rssAuthRejection,
+      fallback: rollup.rssFallback,
+      terminalFailure: rollup.rssTerminalFailure,
+      coverage: rssCoverage,
+      backoffActiveFeeds: rssBackoffActive,
+      maxBackoffRemainingMs: rssMaxBackoffRemainingMs,
+    },
+    aisSnapshot: {
+      requests: rollup.aisSnapshotRequests,
+      served: rollup.aisSnapshotServed,
+      success: rollup.aisSnapshotSuccess,
+      throttle: rollup.aisSnapshotThrottle,
+      timeout: rollup.aisSnapshotTimeout,
+      authRejection: rollup.aisSnapshotAuthRejection,
+      unauthorizedClient: rollup.aisSnapshotUnauthorizedClient,
+      fallback: rollup.aisSnapshotFallback,
+      terminalFailure: rollup.aisSnapshotTerminalFailure,
+    },
     lifetime: {
       openskyRequests: relayMetricsLifetime.openskyRequests,
       openskyCacheHit: relayMetricsLifetime.openskyCacheHit,
@@ -6946,11 +7123,44 @@ function getRelayRollingMetrics() {
       openskyDedup: relayMetricsLifetime.openskyDedup + relayMetricsLifetime.openskyDedupNeg + relayMetricsLifetime.openskyDedupEmpty,
       openskyMiss: relayMetricsLifetime.openskyMiss,
       openskyUpstreamFetches: relayMetricsLifetime.openskyUpstreamFetches,
+      openskyServed: relayMetricsLifetime.openskyServed,
+      openskySuccess: relayMetricsLifetime.openskySuccess,
+      openskyThrottle: relayMetricsLifetime.openskyThrottle,
+      openskyTimeout: relayMetricsLifetime.openskyTimeout,
+      openskyAuthRejection: relayMetricsLifetime.openskyAuthRejection,
+      openskyFallback: relayMetricsLifetime.openskyFallback,
+      openskyTerminalFailure: relayMetricsLifetime.openskyTerminalFailure,
       drops: relayMetricsLifetime.drops,
       notificationDedupSetNxErrors: relayMetricsLifetime.notificationDedupSetNxErrors,
       notificationDedupSetNxFailOpen: relayMetricsLifetime.notificationDedupSetNxFailOpen,
       notificationDedupSetNxFailClosed: relayMetricsLifetime.notificationDedupSetNxFailClosed,
       queueMax: relayMetricsQueueMaxLifetime,
+      googleFlightsRequests: relayMetricsLifetime.googleFlightsRequests,
+      googleFlightsServed: relayMetricsLifetime.googleFlightsServed,
+      googleFlightsSuccess: relayMetricsLifetime.googleFlightsSuccess,
+      googleFlights429: relayMetricsLifetime.googleFlights429,
+      googleFlightsThrottle: relayMetricsLifetime.googleFlightsThrottle,
+      googleFlightsTimeout: relayMetricsLifetime.googleFlightsTimeout,
+      googleFlightsAuthRejection: relayMetricsLifetime.googleFlightsAuthRejection,
+      googleFlightsFallback: relayMetricsLifetime.googleFlightsFallback,
+      googleFlightsTerminalFailure: relayMetricsLifetime.googleFlightsTerminalFailure,
+      rssRequests: relayMetricsLifetime.rssRequests,
+      rssServed: relayMetricsLifetime.rssServed,
+      rssSuccess: relayMetricsLifetime.rssSuccess,
+      rssThrottle: relayMetricsLifetime.rssThrottle,
+      rssTimeout: relayMetricsLifetime.rssTimeout,
+      rssAuthRejection: relayMetricsLifetime.rssAuthRejection,
+      rssFallback: relayMetricsLifetime.rssFallback,
+      rssTerminalFailure: relayMetricsLifetime.rssTerminalFailure,
+      aisSnapshotRequests: relayMetricsLifetime.aisSnapshotRequests,
+      aisSnapshotServed: relayMetricsLifetime.aisSnapshotServed,
+      aisSnapshotSuccess: relayMetricsLifetime.aisSnapshotSuccess,
+      aisSnapshotThrottle: relayMetricsLifetime.aisSnapshotThrottle,
+      aisSnapshotTimeout: relayMetricsLifetime.aisSnapshotTimeout,
+      aisSnapshotAuthRejection: relayMetricsLifetime.aisSnapshotAuthRejection,
+      aisSnapshotUnauthorizedClient: relayMetricsLifetime.aisSnapshotUnauthorizedClient,
+      aisSnapshotFallback: relayMetricsLifetime.aisSnapshotFallback,
+      aisSnapshotTerminalFailure: relayMetricsLifetime.aisSnapshotTerminalFailure,
     },
   };
 }
@@ -7672,6 +7882,23 @@ function buildSnapshot() {
   return lastSnapshot;
 }
 
+function recordAisSnapshotAvailability(snapshot) {
+  const connected = upstreamSocket?.readyState === WebSocket.OPEN;
+  const hasData = Number(snapshot?.status?.vessels) > 0 || Number(snapshot?.status?.messages) > 0;
+  if (connected && hasData) {
+    recordRelayOutcome('aisSnapshot', 'success');
+    incrementRelayMetric('aisSnapshotServed');
+    return 'fresh';
+  }
+  if (!connected && hasData) {
+    recordRelayOutcome('aisSnapshot', 'fallback');
+    incrementRelayMetric('aisSnapshotServed');
+    return 'stale';
+  }
+  recordRelayOutcome('aisSnapshot', 'terminalFailure');
+  return 'unavailable';
+}
+
 setInterval(() => {
   if (upstreamSocket?.readyState === WebSocket.OPEN || vessels.size > 0) {
     buildSnapshot();
@@ -8073,14 +8300,14 @@ const rssResponseCache = new Map(); // key: feed URL → { data, contentType, ti
 const rssInFlight = new Map(); // key: feed URL → Promise (dedup concurrent requests)
 const rssFailureCount = new Map(); // key: feed URL → consecutive failure count (for exponential backoff)
 const rssBackoffUntil = new Map(); // key: feed URL → timestamp when backoff expires
-const RSS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min — RSS feeds rarely update faster
+const RSS_CACHE_TTL_MS = Math.max(1, Number(process.env.RELAY_TEST_RSS_CACHE_TTL_MS) || 5 * 60 * 1000); // 5 min — RSS feeds rarely update faster
 const RSS_NEGATIVE_CACHE_TTL_MS = 60 * 1000; // 1 min base — scaled by 2^failures via backoff
 const RSS_MAX_NEGATIVE_CACHE_TTL_MS = 15 * 60 * 1000; // 15 min cap — stop hammering broken feeds
 const RSS_CACHE_MAX_ENTRIES = 200; // hard cap — ~20 allowed domains × ~5 paths max, with headroom
 
 function rssRecordFailure(feedUrl) {
   const prev = rssFailureCount.get(feedUrl) || 0;
-  const ttl = Math.min(RSS_NEGATIVE_CACHE_TTL_MS * 2 ** prev, RSS_MAX_NEGATIVE_CACHE_TTL_MS);
+  const ttl = nextBackoffMs(prev, RSS_NEGATIVE_CACHE_TTL_MS, RSS_MAX_NEGATIVE_CACHE_TTL_MS);
   rssFailureCount.set(feedUrl, prev + 1);
   rssBackoffUntil.set(feedUrl, Date.now() + ttl);
   return { failures: prev + 1, backoffSec: Math.round(ttl / 1000) };
@@ -8448,6 +8675,7 @@ async function handleOpenSkyRequest(req, res, PORT) {
     const cached = openskyResponseCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < OPENSKY_CACHE_TTL_MS) {
       incrementRelayMetric('openskyCacheHit');
+      incrementRelayMetric('openskyServed');
       touchCacheEntry(openskyResponseCache, cacheKey, cached); // LRU
       return sendPreGzipped(req, res, 200, {
         'Content-Type': 'application/json',
@@ -8461,6 +8689,7 @@ async function handleOpenSkyRequest(req, res, PORT) {
     const negCached = openskyNegativeCache.get(cacheKey);
     if (negCached && Date.now() - negCached.timestamp < OPENSKY_NEGATIVE_CACHE_TTL_MS) {
       incrementRelayMetric('openskyNegativeHit');
+      recordRelayOutcome('opensky', classifyUpstreamOutcome({ status: negCached.status }));
       touchCacheEntry(openskyNegativeCache, cacheKey, negCached); // LRU
       return sendPreGzipped(req, res, 200, {
         'Content-Type': 'application/json',
@@ -8475,12 +8704,15 @@ async function handleOpenSkyRequest(req, res, PORT) {
     //     ALL get 429'd, and the cycle repeats forever with zero data flowing.
     if (Date.now() < openskyGlobal429Until) {
       incrementRelayMetric('openskyNegativeHit');
+      recordRelayOutcome('opensky', 'throttle');
       cacheOpenSkyNegative(cacheKey, 429);
+      const remainSec = Math.max(1, Math.ceil((openskyGlobal429Until - Date.now()) / 1000));
       return sendCompressed(req, res, 200, {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-cache',
         'CDN-Cache-Control': 'no-store',
         'X-Cache': 'RATE-LIMITED',
+        'Retry-After': String(remainSec),
       }, JSON.stringify({ states: [], time: Date.now() }));
     }
 
@@ -8493,6 +8725,7 @@ async function handleOpenSkyRequest(req, res, PORT) {
       const deduped = openskyResponseCache.get(cacheKey);
       if (deduped && Date.now() - deduped.timestamp < OPENSKY_CACHE_TTL_MS) {
         incrementRelayMetric('openskyDedup');
+        incrementRelayMetric('openskyServed');
         touchCacheEntry(openskyResponseCache, cacheKey, deduped); // LRU
         return sendPreGzipped(req, res, 200, {
           'Content-Type': 'application/json',
@@ -8504,6 +8737,7 @@ async function handleOpenSkyRequest(req, res, PORT) {
       const dedupNeg = openskyNegativeCache.get(cacheKey);
       if (dedupNeg && Date.now() - dedupNeg.timestamp < OPENSKY_NEGATIVE_CACHE_TTL_MS) {
         incrementRelayMetric('openskyDedupNeg');
+        recordRelayOutcome('opensky', classifyUpstreamOutcome({ status: dedupNeg.status }));
         touchCacheEntry(openskyNegativeCache, cacheKey, dedupNeg); // LRU
         return sendPreGzipped(req, res, 200, {
           'Content-Type': 'application/json',
@@ -8514,6 +8748,7 @@ async function handleOpenSkyRequest(req, res, PORT) {
       }
       // In-flight completed but no cache entry (upstream failed) — return empty instead of thundering herd
       incrementRelayMetric('openskyDedupEmpty');
+      recordRelayOutcome('opensky', 'terminalFailure');
       return sendPreGzipped(req, res, 200, {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-cache',
@@ -8541,6 +8776,7 @@ async function handleOpenSkyRequest(req, res, PORT) {
       // Only negative-cache actual upstream 429/5xx responses.
       settleFlight();
       openskyInFlight.delete(cacheKey);
+      recordRelayOutcome('opensky', 'authRejection');
       return safeEnd(res, 503, { 'Content-Type': 'application/json' },
         JSON.stringify({ error: 'OpenSky not configured or auth failed', time: Date.now(), states: [] }));
     }
@@ -8556,6 +8792,10 @@ async function handleOpenSkyRequest(req, res, PORT) {
     // Serialized fetch — queued with spacing to prevent concurrent 429 storms
     const result = await openskyQueuedFetch(openskyUrl, token);
     const upstreamStatus = result.status || 502;
+    const upstreamOutcome = result.error
+      ? classifyUpstreamOutcome({ status: upstreamStatus, error: result.error })
+      : classifyUpstreamOutcome({ status: upstreamStatus });
+    recordRelayOutcome('opensky', upstreamOutcome);
 
     if (upstreamStatus === 401) {
       openskyToken = null;
@@ -8570,6 +8810,7 @@ async function handleOpenSkyRequest(req, res, PORT) {
     if (upstreamStatus === 200 && result.data) {
       cacheOpenSkyPositive(cacheKey, result.data);
       openskyNegativeCache.delete(cacheKey);
+      incrementRelayMetric('openskyServed');
     } else if (result.error) {
       logThrottled('error', `opensky-error:${cacheKey}:${result.error.code || result.error.message}`, '[Relay] OpenSky error:', result.error.message);
       cacheOpenSkyNegative(cacheKey, upstreamStatus || 500);
@@ -8584,17 +8825,26 @@ async function handleOpenSkyRequest(req, res, PORT) {
 
     // Serve stale cache on network errors
     if (result.error && cached) {
+      incrementRelayMetric('openskyServed');
+      recordRelayOutcome('opensky', 'fallback');
       return sendPreGzipped(req, res, 200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'CDN-Cache-Control': 'no-store', 'X-Cache': 'STALE' }, cached.data, cached.gzip, cached.brotli);
     }
 
     const responseData = result.data || JSON.stringify({ error: result.error?.message || 'upstream error', time: Date.now(), states: null });
-    return sendCompressed(req, res, upstreamStatus, {
+    const responseHeaders = {
       'Content-Type': 'application/json',
       'Cache-Control': upstreamStatus === 200 ? 'public, max-age=30' : 'no-cache',
       'CDN-Cache-Control': upstreamStatus === 200 ? 'public, max-age=15' : 'no-store',
       'X-Cache': result.rateLimited ? 'RATE-LIMITED' : 'MISS',
+    };
+    if (upstreamStatus === 429) {
+      responseHeaders['Retry-After'] = String(Math.max(1, Math.ceil((openskyGlobal429Until - Date.now()) / 1000)));
+    }
+    return sendCompressed(req, res, upstreamStatus, {
+      ...responseHeaders,
     }, responseData);
   } catch (err) {
+    recordRelayOutcome('opensky', classifyUpstreamOutcome({ error: err }));
     if (settleFlight) settleFlight();
     if (!cacheKey) {
       try {
@@ -9505,6 +9755,12 @@ const server = http.createServer(async (req, res) => {
   const isPublicRoute = pathname === '/health' || pathname === '/' || isRssRoute || pathname.startsWith('/widget-agent');
   if (!isPublicRoute) {
     if (!isAuthorizedRequest(req)) {
+      const routeGroup = getRouteGroup(pathname);
+      if (routeGroup === 'snapshot') incrementRelayMetric('aisSnapshotUnauthorizedClient');
+      else if (routeGroup === 'opensky') recordRelayOutcome('opensky', 'authRejection');
+      else if (routeGroup === 'google-flights') recordRelayOutcome('googleFlights', 'authRejection');
+      else if (routeGroup === 'rss') recordRelayOutcome('rss', 'authRejection');
+      else recordRelayOutcome('other', 'authRejection');
       return safeEnd(res, 401, { 'Content-Type': 'application/json' },
         JSON.stringify({ error: 'Unauthorized', time: Date.now() }));
     }
@@ -9513,6 +9769,20 @@ const server = http.createServer(async (req, res) => {
   if (pathname !== '/health' && pathname !== '/') {
     const rl = consumeRateLimit(req, pathname, isPublicRoute);
     if (rl.limited) {
+      const routeGroup = getRouteGroup(pathname);
+      if (routeGroup === 'opensky') {
+        incrementRelayMetric('openskyRequests');
+        recordRelayOutcome('opensky', 'throttle');
+      } else if (routeGroup === 'google-flights') {
+        incrementRelayMetric('googleFlightsRequests');
+        recordRelayOutcome('googleFlights', 'throttle');
+      } else if (routeGroup === 'rss') {
+        incrementRelayMetric('rssRequests');
+        recordRelayOutcome('rss', 'throttle');
+      } else if (routeGroup === 'snapshot') {
+        incrementRelayMetric('aisSnapshotRequests');
+        recordRelayOutcome('aisSnapshot', 'throttle');
+      }
       const retryAfterSec = Math.max(1, Math.ceil(rl.resetInMs / 1000));
       return safeEnd(res, 429, {
         'Content-Type': 'application/json',
@@ -9526,6 +9796,11 @@ const server = http.createServer(async (req, res) => {
 
   if (pathname === '/health' || pathname === '/') {
     const mem = process.memoryUsage();
+    const ingestion = getRelayRollingMetrics();
+    const aisSnapshotDegraded = ingestion.aisSnapshot.requests > 0 && ingestion.aisSnapshot.served === 0;
+    const ingestionDegraded = ingestion.aviation.coverage.status === 'degraded'
+      || ingestion.rss.coverage.status === 'degraded'
+      || aisSnapshotDegraded;
     // ⚠ SECURITY — read before adding fields to this response.
     //
     // /health is in `isPublicRoute` (no auth check). Fields here are
@@ -9557,7 +9832,19 @@ const server = http.createServer(async (req, res) => {
     // response. The `ais-relay-health-no-secret-recon` test asserts the
     // removed fields don't reappear here.
     sendCompressed(req, res, 200, { 'Content-Type': 'application/json' }, JSON.stringify({
+      // Keep the historical liveness status stable for Railway probes; the
+      // ingestion verdict is explicit below so monitors can alert without
+      // turning an application-level coverage dip into a process outage.
       status: 'ok',
+      ingestion: {
+        status: ingestionDegraded ? 'degraded' : 'ok',
+        aviation: ingestion.aviation,
+        rss: ingestion.rss,
+        aisSnapshot: {
+          ...ingestion.aisSnapshot,
+          connected: upstreamSocket?.readyState === WebSocket.OPEN,
+        },
+      },
       clients: clients.size,
       messages: messageCount,
       droppedMessages,
@@ -9615,9 +9902,10 @@ const server = http.createServer(async (req, res) => {
       'Cache-Control': 'no-store',
     }, JSON.stringify(getRelayRollingMetrics()));
   } else if (pathname.startsWith('/ais/snapshot')) {
+    incrementRelayMetric('aisSnapshotRequests');
     // Aggregated AIS snapshot for server-side fanout — serve pre-serialized + pre-gzipped
     connectUpstream();
-    buildSnapshot(); // ensures cache is warm
+    recordAisSnapshotAvailability(buildSnapshot()); // ensures cache is warm and records usable freshness
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const includeCandidates = url.searchParams.get('candidates') === 'true';
     const includeTankers = url.searchParams.get('tankers') === 'true';
@@ -9784,16 +10072,19 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Missing url parameter' }));
       }
+      incrementRelayMetric('rssRequests');
 
       // Domain allowlist from shared source of truth (shared/rss-allowed-domains.js)
       const parsed = new URL(feedUrl);
       // Block deprecated/stale feed domains — stale clients still request these
       const blockedDomains = ['rsshub.app'];
       if (blockedDomains.includes(parsed.hostname)) {
+        recordRelayOutcome('rss', 'terminalFailure');
         res.writeHead(410, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Feed deprecated' }));
       }
       if (!RSS_ALLOWED_DOMAINS.has(parsed.hostname)) {
+        recordRelayOutcome('rss', 'terminalFailure');
         res.writeHead(403, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Domain not allowed on Railway proxy' }));
       }
@@ -9804,6 +10095,9 @@ const server = http.createServer(async (req, res) => {
       if (backoffExpiry && backoffNow < backoffExpiry) {
         const rssCachedForBackoff = rssResponseCache.get(feedUrl);
         if (rssCachedForBackoff && rssCachedForBackoff.statusCode >= 200 && rssCachedForBackoff.statusCode < 300) {
+          recordRelayOutcome('rss', 'throttle');
+          recordRelayOutcome('rss', 'fallback');
+          incrementRelayMetric('rssServed');
           return sendCompressed(req, res, 200, {
             'Content-Type': rssCachedForBackoff.contentType || 'application/xml',
             'Cache-Control': 'no-store', 'CDN-Cache-Control': 'no-store',
@@ -9811,6 +10105,7 @@ const server = http.createServer(async (req, res) => {
           }, rssCachedForBackoff.data);
         }
         const remainSec = Math.max(1, Math.round((backoffExpiry - backoffNow) / 1000));
+        recordRelayOutcome('rss', 'throttle');
         res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': String(remainSec) });
         return res.end(JSON.stringify({ error: 'Feed in backoff', retryAfterSec: remainSec }));
       }
@@ -9825,6 +10120,11 @@ const server = http.createServer(async (req, res) => {
         const ttl = (rssCached.statusCode && rssCached.statusCode >= 200 && rssCached.statusCode < 300)
           ? RSS_CACHE_TTL_MS : RSS_NEGATIVE_CACHE_TTL_MS;
         if (Date.now() - rssCached.timestamp < ttl) {
+          if (rssCached.statusCode < 200 || rssCached.statusCode >= 300) {
+            recordRelayOutcome('rss', classifyUpstreamOutcome({ status: rssCached.statusCode }));
+          } else {
+            incrementRelayMetric('rssServed');
+          }
           return sendCompressed(req, res, rssCached.statusCode || 200, {
             'Content-Type': rssCached.contentType || 'application/xml',
             'Cache-Control': rssCached.statusCode >= 200 && rssCached.statusCode < 300 ? 'public, max-age=300' : 'no-cache',
@@ -9842,6 +10142,11 @@ const server = http.createServer(async (req, res) => {
           await existing;
           const deduped = rssResponseCache.get(feedUrl);
           if (deduped) {
+            if (deduped.statusCode < 200 || deduped.statusCode >= 300) {
+              recordRelayOutcome('rss', classifyUpstreamOutcome({ status: deduped.statusCode }));
+            } else {
+              incrementRelayMetric('rssServed');
+            }
             return sendCompressed(req, res, deduped.statusCode || 200, {
               'Content-Type': deduped.contentType || 'application/xml',
               'Cache-Control': deduped.statusCode >= 200 && deduped.statusCode < 300 ? 'public, max-age=300' : 'no-cache',
@@ -9850,10 +10155,12 @@ const server = http.createServer(async (req, res) => {
             }, deduped.data);
           }
           // In-flight completed but nothing cached — serve 502 instead of cascading
+          recordRelayOutcome('rss', 'terminalFailure');
           return safeEnd(res, 502, { 'Content-Type': 'application/json' },
             JSON.stringify({ error: 'Upstream fetch completed but not cached' }));
         } catch {
           // In-flight fetch failed — serve 502 instead of starting another fetch
+          recordRelayOutcome('rss', 'terminalFailure');
           return safeEnd(res, 502, { 'Content-Type': 'application/json' },
             JSON.stringify({ error: 'Upstream fetch failed' }));
         }
@@ -9863,11 +10170,34 @@ const server = http.createServer(async (req, res) => {
 
       const fetchPromise = new Promise((resolveInFlight, rejectInFlight) => {
       let responseHandled = false;
+      let outcomeRecorded = false;
+      let failureRecorded = false;
+
+      const recordAttemptOutcome = (status, error) => {
+        if (outcomeRecorded) return;
+        outcomeRecorded = true;
+        recordRelayOutcome('rss', classifyUpstreamOutcome({ status, error }));
+      };
+
+      const recordFailure = () => {
+        if (failureRecorded) {
+          const failures = rssFailureCount.get(feedUrl) || 1;
+          const remaining = Math.max(1, Math.round(((rssBackoffUntil.get(feedUrl) || Date.now()) - Date.now()) / 1000));
+          return { failures, backoffSec: remaining };
+        }
+        failureRecorded = true;
+        return rssRecordFailure(feedUrl);
+      };
 
       const sendError = (statusCode, message) => {
         if (responseHandled || res.headersSent) return;
         responseHandled = true;
-        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        recordAttemptOutcome(statusCode, new Error(message));
+        const { backoffSec } = recordFailure();
+        res.writeHead(statusCode, {
+          'Content-Type': 'application/json',
+          'Retry-After': String(backoffSec),
+        });
         res.end(JSON.stringify({ error: message }));
         rejectInFlight(new Error(message));
       };
@@ -9914,6 +10244,8 @@ const server = http.createServer(async (req, res) => {
 
           if (response.statusCode === 304 && rssCached) {
             responseHandled = true;
+            recordAttemptOutcome(200);
+            incrementRelayMetric('rssServed');
             rssCached.timestamp = Date.now();
             rssResetFailure(feedUrl);
             resolveInFlight();
@@ -9950,34 +10282,43 @@ const server = http.createServer(async (req, res) => {
               etag: response.headers.etag || null,
               lastModified: response.headers['last-modified'] || null,
             });
-            if (response.statusCode >= 200 && response.statusCode < 300) {
-              rssResetFailure(feedUrl);
-            } else {
-              const { failures, backoffSec } = rssRecordFailure(feedUrl);
-              logThrottled('warn', `rss-upstream:${feedUrl}:${response.statusCode}`, `[Relay] RSS upstream ${response.statusCode} for ${feedUrl} (backoff ${backoffSec}s, failures=${failures})`);
-            }
-            resolveInFlight();
-            sendCompressed(req, res, response.statusCode, {
+            const responseHeaders = {
               'Content-Type': 'application/xml',
               'Cache-Control': response.statusCode >= 200 && response.statusCode < 300 ? 'public, max-age=300' : 'no-cache',
               'CDN-Cache-Control': response.statusCode >= 200 && response.statusCode < 300 ? 'public, max-age=600, stale-while-revalidate=300' : 'no-store',
               'X-Cache': 'MISS',
-            }, data);
+            };
+            if (response.statusCode >= 200 && response.statusCode < 300) {
+              recordAttemptOutcome(response.statusCode);
+              incrementRelayMetric('rssServed');
+              rssResetFailure(feedUrl);
+            } else {
+              recordAttemptOutcome(response.statusCode);
+              const { failures, backoffSec } = recordFailure();
+              logThrottled('warn', `rss-upstream:${feedUrl}:${response.statusCode}`, `[Relay] RSS upstream ${response.statusCode} for ${feedUrl} (backoff ${backoffSec}s, failures=${failures})`);
+              responseHeaders['Retry-After'] = String(backoffSec);
+            }
+            resolveInFlight();
+            sendCompressed(req, res, response.statusCode, responseHeaders, data);
           });
           stream.on('error', (err) => {
-            const { failures, backoffSec } = rssRecordFailure(feedUrl);
+            recordAttemptOutcome(502, err);
+            const { failures, backoffSec } = recordFailure();
             logThrottled('error', `rss-decompress:${feedUrl}:${err.code || err.message}`, `[Relay] Decompression error: ${err.message} (backoff ${backoffSec}s, failures=${failures})`);
             sendError(502, 'Decompression failed: ' + err.message);
           });
         });
 
         request.on('error', (err) => {
-          const { failures, backoffSec } = rssRecordFailure(feedUrl);
+          recordAttemptOutcome(0, err);
+          const { failures, backoffSec } = recordFailure();
           logThrottled('error', `rss-error:${feedUrl}:${err.code || err.message}`, `[Relay] RSS error: ${err.message} (backoff ${backoffSec}s, failures=${failures})`);
           // Serve stale on error (only if we have previous successful data)
           if (rssCached && rssCached.statusCode >= 200 && rssCached.statusCode < 300) {
             if (!responseHandled && !res.headersSent) {
               responseHandled = true;
+              incrementRelayMetric('rssServed');
+              recordRelayOutcome('rss', 'fallback');
               sendCompressed(req, res, 200, { 'Content-Type': 'application/xml', 'Cache-Control': 'no-store', 'CDN-Cache-Control': 'no-store', 'X-Cache': 'STALE' }, rssCached.data);
             }
             resolveInFlight();
@@ -9988,10 +10329,13 @@ const server = http.createServer(async (req, res) => {
 
         request.on('timeout', () => {
           request.destroy();
-          const { failures, backoffSec } = rssRecordFailure(feedUrl);
+          recordAttemptOutcome(504, new Error('timeout'));
+          const { failures, backoffSec } = recordFailure();
           logThrottled('warn', `rss-timeout:${feedUrl}`, `[Relay] RSS timeout for ${feedUrl} (backoff ${backoffSec}s, failures=${failures})`);
           if (rssCached && rssCached.statusCode >= 200 && rssCached.statusCode < 300 && !responseHandled && !res.headersSent) {
             responseHandled = true;
+            incrementRelayMetric('rssServed');
+            recordRelayOutcome('rss', 'fallback');
             sendCompressed(req, res, 200, { 'Content-Type': 'application/xml', 'Cache-Control': 'no-store', 'CDN-Cache-Control': 'no-store', 'X-Cache': 'STALE' }, rssCached.data);
             resolveInFlight();
             return;
@@ -10095,6 +10439,12 @@ const GF_HEADERS = {
   'Origin': 'https://www.google.com',
   'Referer': 'https://www.google.com/flights',
 };
+
+let gfGlobal429Until = 0;
+const GF_429_COOLDOWN_MS = Number(process.env.GF_429_COOLDOWN_MS) || 120 * 1000;
+const gfNegativeCache = new Map();
+const GF_NEGATIVE_CACHE_TTL = 60 * 1000;
+const GF_NEGATIVE_CACHE_MAX = 64;
 
 /**
  * Encode a Google Flights filter structure for use in f.req POST body.
@@ -10355,6 +10705,7 @@ async function handleGoogleFlightsSearch(req, res) {
       res.end(JSON.stringify({ error: 'origin, destination, departure_date required' }));
       return;
     }
+    incrementRelayMetric('googleFlightsRequests');
 
     const filters = buildFlightFilters({
       origin, destination,
@@ -10369,22 +10720,59 @@ async function handleGoogleFlightsSearch(req, res) {
     });
 
     const body = `f.req=${encodeGfFilters(filters)}`;
+
+    // Global 429 cooldown: block upstream fetches during cooldown
+    if (Date.now() < gfGlobal429Until) {
+      incrementRelayMetric('googleFlights429');
+      recordRelayOutcome('googleFlights', 'throttle');
+      const flights = [];
+      const retryAfter = Math.max(1, Math.ceil((gfGlobal429Until - Date.now()) / 1000));
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) });
+      res.end(JSON.stringify({ flights, cooldown: true }));
+      return;
+    }
+
     const gfResp = await fetch(GF_SHOPPING_URL, {
       method: 'POST',
       headers: GF_HEADERS,
       body,
       signal: AbortSignal.timeout(15_000),
     });
-    if (!gfResp.ok) throw new Error(`Google Flights returned ${gfResp.status}`);
-
+    if (gfResp.status === 429) {
+      gfGlobal429Until = Date.now() + GF_429_COOLDOWN_MS;
+      console.warn(`[Google Flights] 429 — global cooldown ${GF_429_COOLDOWN_MS / 1000}s`);
+      incrementRelayMetric('googleFlights429');
+      recordRelayOutcome('googleFlights', 'throttle');
+      throw new Error(`Google Flights returned ${gfResp.status}`);
+    }
+    if (gfResp.status === 401 || gfResp.status === 403) {
+      recordRelayOutcome('googleFlights', 'authRejection');
+      throw new Error(`Google Flights returned ${gfResp.status}`);
+    }
+    if (!gfResp.ok) {
+      recordRelayOutcome('googleFlights', 'terminalFailure');
+      throw new Error(`Google Flights returned ${gfResp.status}`);
+    }
     const text = await gfResp.text();
     const flights = parseGfFlights(text);
+    recordRelayOutcome('googleFlights', 'success');
+    incrementRelayMetric('googleFlightsServed');
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ flights }));
   } catch (err) {
+    const isTimeout = err?.name === 'TimeoutError' || err?.message?.includes('timed out');
+    if (isTimeout) {
+      recordRelayOutcome('googleFlights', 'timeout');
+    } else if (!err?.message?.startsWith('Google Flights returned')) {
+      recordRelayOutcome('googleFlights', 'terminalFailure');
+    }
     console.error('[Google Flights] search error:', err?.message || err);
-    res.writeHead(502, { 'Content-Type': 'application/json' });
+    const retryAfter = Math.max(0, Math.ceil((gfGlobal429Until - Date.now()) / 1000));
+    res.writeHead(502, {
+      'Content-Type': 'application/json',
+      ...(retryAfter > 0 ? { 'Retry-After': String(retryAfter) } : {}),
+    });
     res.end(JSON.stringify({ error: err?.message || 'search failed', flights: [] }));
   }
 }
@@ -10426,19 +10814,55 @@ async function handleGoogleFlightsDates(req, res) {
     const end = new Date(endDate);
     const totalDays = Math.ceil((end - start) / 86_400_000) + 1;
     const MAX_CHUNK = 61;
+    const MAX_DATE_CHUNKS = 6;
     const allDates = [];
     let hasPartialFailure = false;
 
     if (totalDays <= MAX_CHUNK) {
+      incrementRelayMetric('googleFlightsRequests');
+      if (Date.now() < gfGlobal429Until) {
+        incrementRelayMetric('googleFlights429');
+        recordRelayOutcome('googleFlights', 'throttle');
+        const retryAfter = Math.max(1, Math.ceil((gfGlobal429Until - Date.now()) / 1000));
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) });
+        res.end(JSON.stringify({ dates: [], partial: false, cooldown: true }));
+        return;
+      }
       const filters = buildDateFilters(params);
       const body = `f.req=${encodeGfFilters(filters)}`;
       const gfResp = await fetch(GF_CALENDAR_URL, { method: 'POST', headers: GF_HEADERS, body, signal: AbortSignal.timeout(20_000) });
-      if (!gfResp.ok) throw new Error(`Google Flights returned ${gfResp.status}`);
+      if (gfResp.status === 429) {
+        gfGlobal429Until = Date.now() + GF_429_COOLDOWN_MS;
+        console.warn(`[Google Flights] dates 429 — global cooldown ${GF_429_COOLDOWN_MS / 1000}s`);
+        incrementRelayMetric('googleFlights429');
+        recordRelayOutcome('googleFlights', 'throttle');
+        throw new Error(`Google Flights returned ${gfResp.status}`);
+      }
+      if (gfResp.status === 401 || gfResp.status === 403) {
+        recordRelayOutcome('googleFlights', 'authRejection');
+        throw new Error(`Google Flights returned ${gfResp.status}`);
+      }
+      if (!gfResp.ok) {
+        recordRelayOutcome('googleFlights', 'terminalFailure');
+        throw new Error(`Google Flights returned ${gfResp.status}`);
+      }
       const text = await gfResp.text();
       allDates.push(...parseGfDates(text, isRoundTrip));
+      recordRelayOutcome('googleFlights', 'success');
+      incrementRelayMetric('googleFlightsServed');
     } else {
       const current = new Date(start);
-      while (current <= end) {
+      let chunksAttempted = 0;
+      while (current <= end && chunksAttempted < MAX_DATE_CHUNKS) {
+        chunksAttempted++;
+        incrementRelayMetric('googleFlightsRequests');
+        if (Date.now() < gfGlobal429Until) {
+          incrementRelayMetric('googleFlights429');
+          recordRelayOutcome('googleFlights', 'throttle');
+          hasPartialFailure = true;
+          current.setDate(current.getDate() + MAX_CHUNK);
+          continue;
+        }
         const chunkEnd = new Date(current);
         chunkEnd.setDate(chunkEnd.getDate() + MAX_CHUNK - 1);
         if (chunkEnd > end) chunkEnd.setTime(end.getTime());
@@ -10449,26 +10873,59 @@ async function handleGoogleFlightsDates(req, res) {
           endDate: chunkEnd.toISOString().slice(0, 10),
         });
         const body = `f.req=${encodeGfFilters(chunkFilters)}`;
-        const gfResp = await fetch(GF_CALENDAR_URL, { method: 'POST', headers: GF_HEADERS, body, signal: AbortSignal.timeout(20_000) });
-        if (gfResp.ok) {
+        let gfResp;
+        try {
+          gfResp = await fetch(GF_CALENDAR_URL, { method: 'POST', headers: GF_HEADERS, body, signal: AbortSignal.timeout(20_000) });
+        } catch (err) {
+          recordRelayOutcome('googleFlights', classifyUpstreamOutcome({ error: err }));
+          hasPartialFailure = true;
+          current.setDate(current.getDate() + MAX_CHUNK);
+          continue;
+        }
+        if (gfResp.status === 429) {
+          gfGlobal429Until = Date.now() + GF_429_COOLDOWN_MS;
+          console.warn(`[Google Flights] chunk 429 — global cooldown ${GF_429_COOLDOWN_MS / 1000}s`);
+          incrementRelayMetric('googleFlights429');
+          recordRelayOutcome('googleFlights', 'throttle');
+          hasPartialFailure = true;
+        } else if (gfResp.status === 401 || gfResp.status === 403) {
+          recordRelayOutcome('googleFlights', 'authRejection');
+          hasPartialFailure = true;
+        } else if (gfResp.ok) {
           const text = await gfResp.text();
           allDates.push(...parseGfDates(text, isRoundTrip));
+          recordRelayOutcome('googleFlights', 'success');
+          incrementRelayMetric('googleFlightsServed');
         } else {
+          recordRelayOutcome('googleFlights', 'terminalFailure');
           hasPartialFailure = true;
           console.warn(`[Google Flights] dates chunk ${current.toISOString().slice(0, 10)} failed: ${gfResp.status}`);
         }
         current.setDate(current.getDate() + MAX_CHUNK);
       }
+      if (current <= end) hasPartialFailure = true;
     }
 
     const sortByPrice = url.searchParams.get('sort_by_price') === 'true';
     if (sortByPrice) allDates.sort((a, b) => a.price - b.price);
 
+    if (hasPartialFailure && allDates.length > 0) recordRelayOutcome('googleFlights', 'fallback');
+
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ dates: allDates, partial: hasPartialFailure }));
   } catch (err) {
+    const isTimeout = err?.name === 'TimeoutError' || err?.message?.includes('timed out');
+    if (isTimeout) {
+      recordRelayOutcome('googleFlights', 'timeout');
+    } else if (!err?.message?.startsWith('Google Flights returned')) {
+      recordRelayOutcome('googleFlights', 'terminalFailure');
+    }
     console.error('[Google Flights] dates error:', err?.message || err);
-    res.writeHead(502, { 'Content-Type': 'application/json' });
+    const retryAfter = Math.max(0, Math.ceil((gfGlobal429Until - Date.now()) / 1000));
+    res.writeHead(502, {
+      'Content-Type': 'application/json',
+      ...(retryAfter > 0 ? { 'Retry-After': String(retryAfter) } : {}),
+    });
     res.end(JSON.stringify({ error: err?.message || 'search failed', dates: [] }));
   }
 }
@@ -11376,8 +11833,25 @@ function switchTab(btn, key) {
 
 // ─── End Widget Agent ────────────────────────────────────────────────────────
 
+function scheduleUpstreamReconnect() {
+  if (relayShuttingDown || upstreamReconnectTimer || !API_KEY) return;
+  const delayMs = nextBackoffMs(upstreamReconnectFailures, AIS_RECONNECT_BASE_MS, AIS_RECONNECT_MAX_MS);
+  upstreamReconnectFailures++;
+  upstreamReconnectTimer = setTimeout(() => {
+    upstreamReconnectTimer = null;
+    connectUpstream();
+  }, delayMs);
+  upstreamReconnectTimer.unref?.();
+  console.log(`[Relay] AIS reconnect scheduled in ${Math.ceil(delayMs / 1000)}s (attempt=${upstreamReconnectFailures})`);
+}
+
 function connectUpstream() {
   if (!API_KEY) return;
+
+  if (upstreamReconnectTimer) {
+    clearTimeout(upstreamReconnectTimer);
+    upstreamReconnectTimer = null;
+  }
 
   // Skip if already connected or connecting
   if (upstreamSocket?.readyState === WebSocket.OPEN ||
@@ -11437,6 +11911,7 @@ function connectUpstream() {
       return;
     }
     console.log('[Relay] Connected to aisstream.io');
+    upstreamReconnectFailures = 0;
     socket.send(JSON.stringify({
       APIKey: API_KEY,
       BoundingBoxes: [[[-90, -180], [90, 180]]],
@@ -11474,8 +11949,8 @@ function connectUpstream() {
       upstreamSocket = null;
       clearUpstreamQueue();
       upstreamPaused = false;
-      console.log('[Relay] Disconnected, reconnecting in 5s...');
-      setTimeout(connectUpstream, 5000);
+      console.log('[Relay] Disconnected');
+      scheduleUpstreamReconnect();
     }
   });
 
@@ -11487,7 +11962,12 @@ function connectUpstream() {
 const wss = new WebSocketServer({ server });
 
 server.listen(PORT, () => {
-  console.log(`[Relay] WebSocket relay on port ${PORT} (OpenSky: ${OPENSKY_PROXY_ENABLED ? 'via proxy' : 'direct'})`);
+  const listeningPort = server.address()?.port || PORT;
+  console.log(`[Relay] WebSocket relay on port ${listeningPort} (OpenSky: ${OPENSKY_PROXY_ENABLED ? 'via proxy' : 'direct'})`);
+  if (RELAY_TEST_MODE) {
+    console.log('[Relay] Test mode enabled — background seed loops are disabled');
+    return;
+  }
   startTelegramPollLoop();
   startOrefPollLoop();
   startUcdpSeedLoop();
@@ -11576,6 +12056,11 @@ setInterval(() => {
 // Railway sends SIGTERM during deploys; without this, the old container keeps
 // the Telegram session alive while the new container connects → AUTH_KEY_DUPLICATED.
 async function gracefulShutdown(signal) {
+  relayShuttingDown = true;
+  if (upstreamReconnectTimer) {
+    clearTimeout(upstreamReconnectTimer);
+    upstreamReconnectTimer = null;
+  }
   console.log(`[Relay] ${signal} received — shutting down`);
   if (telegramState.client) {
     console.log('[Relay] Disconnecting Telegram client...');

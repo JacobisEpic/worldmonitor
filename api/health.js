@@ -1,6 +1,11 @@
 import { getCorsHeaders, isDisallowedOrigin } from './_cors.js';
 import { jsonResponse } from './_json-response.js';
 import { USER_API_KEY_GATEWAY_VALIDATION_ERROR, validateApiKey } from './_api-key.js';
+import {
+  hasPoolCoverageShortfall,
+  parsePoolCounts,
+  PREDICTION_MARKET_MIN_POOL_COUNTS,
+} from './_pool-coverage.js';
 // Seed-envelope helper. PR 1 imports it here so PR 2 can wire envelope-aware
 // reads at specific call sites without further plumbing. It's a no-op on
 // legacy-shape seed-meta values (they have no `_seed` wrapper and pass through
@@ -122,6 +127,7 @@ const BOOTSTRAP_KEYS = {
   consumerPricesMovers:     'consumer-prices:movers:ae:30d',
   consumerPricesSpread:     'consumer-prices:retailer-spread:ae:essentials-ae',
   consumerPricesFreshness:  'consumer-prices:freshness:ae',
+  consumerPricesCoverage:   'consumer-prices:coverage:ae',
   groceryBasket:     'economic:grocery-basket:v1',
   bigmac:            'economic:bigmac:v1',
   fuelPrices:        'economic:fuel-prices:v1',
@@ -390,8 +396,26 @@ const SEED_META = {
   hkoWarnings:      { key: 'seed-meta:weather:hko-warnings',    maxStaleMin: 540 }, // successful HKO responses publish a snapshot even when no tropical-cyclone warning is active.
   flightDelays:     { key: 'seed-meta:aviation:faa',            maxStaleMin: 90 }, // CACHE_TTL=7200s; matches notamClosures from same cron
   notamClosures:    { key: 'seed-meta:aviation:notam',          maxStaleMin: 240 }, // 2h interval; 240min = 2x interval
-  predictionMarkets: { key: 'seed-meta:prediction:markets',     maxStaleMin: 90, minRecordCount: 20 }, // #5733: declareRecords now counts DISTINCT markets (it triple-counted across the pre-partition near-duplicate pools, reporting ~75 for 46 real markets), so a volume collapse is finally measurable. Floor is deliberately well under the ~46 steady state and well over a broken run — the publish gate only catches mislabeling, so without this a run that shrinks every pool while each stays non-empty stays GREEN.
-  newsInsights:     { key: 'seed-meta:news:insights',           maxStaleMin: 30 },
+  predictionMarkets: {
+    key: 'seed-meta:prediction:markets',
+    maxStaleMin: 90,
+    minRecordCount: 20,
+    // #5875: one is the narrowest floor that detects a dead category signal
+    // without treating ordinary pool-volume variation as an incident.
+    minPoolCounts: PREDICTION_MARKET_MIN_POOL_COUNTS,
+  },
+  newsInsights:     {
+    key: 'seed-meta:news:insights',
+    maxStaleMin: 30,
+    // `fetchedAt` is deliberately held at the served LKG timestamp when a
+    // synthesis is rejected. This separate bounded contract warns before the
+    // generic 30-minute seed-age gate when repeated attempts keep failing.
+    synthesisFailure: {
+      warnAfterConsecutive: 2,
+      warnAfterAgeMin: 20,
+      warnWithoutSuccess: true,
+    },
+  },
   // #4920: daily GH Actions cadence; 2880 = 2x — one fully missed day alarms
   newsFeedHealth:   { key: 'seed-meta:news:feed-health',        maxStaleMin: 2880 },
   newsRecallBenchmark: { key: 'seed-meta:news:recall-benchmark', maxStaleMin: 2880 },
@@ -506,11 +530,11 @@ const SEED_META = {
   comtradeFlows:       { key: 'seed-meta:trade:comtrade-flows',               maxStaleMin: 2880 }, // 24h cron; 2880min = 48h = 2x interval
   comtradeBilateralHs4: { key: 'seed-meta:comtrade:bilateral-hs4',             maxStaleMin: 50400, minRecordCount: 110 }, // 35d health budget for monthly seed; 40d payload/meta TTL leaves a 5d stale-but-queryable warning window. minRecordCount mirrors MIN_COUNTRY_COVERAGE in scripts/seed-comtrade-bilateral-hs4.mjs (110 of 197 clusters) so a shrunken run reads COVERAGE_PARTIAL, not OK — without it 3-of-197 and 197-of-197 were indistinguishable for the full 35d window.
   blsSeries:           { key: 'seed-meta:economic:bls-series',                maxStaleMin: 2880 }, // daily seed; 2880min = 48h = 2x interval
-  sanctionsPressure:   { key: 'seed-meta:sanctions:pressure',                 maxStaleMin: 720 },
+  sanctionsPressure:   { key: 'seed-meta:sanctions:pressure',                 maxStaleMin: 720 }, // 6h cron; 12h = 2× interval, before the 18h data TTL
   crossSourceSignals:  { key: 'seed-meta:intelligence:cross-source-signals',  maxStaleMin: 30 }, // 15min cron; 30min = 2x interval
   regionalSnapshots:   { key: 'seed-meta:intelligence:regional-snapshots',    maxStaleMin: 720 }, // 6h cron via seed-bundle-derived-signals; 720min = 12h = 2x interval
   regionalBriefs:      { key: 'seed-meta:intelligence:regional-briefs',      maxStaleMin: 20160 }, // weekly cron; 20160min = 14 days = 2x interval
-  sanctionsEntities:   { key: 'seed-meta:sanctions:entities',                 maxStaleMin: 1440 }, // 12h cron; 1440min = 24h = 2x interval
+  sanctionsEntities:   { key: 'seed-meta:sanctions:entities',                 maxStaleMin: 720 }, // same 6h producer; co-pinned with pressure so both alarm before the 18h TTL
   radiationWatch:      { key: 'seed-meta:radiation:observations',             maxStaleMin: 30 },
   groceryBasket:       { key: 'seed-meta:economic:grocery-basket',            maxStaleMin: 10080 }, // weekly seed; 10080 = 7 days
   bigmac:              { key: 'seed-meta:economic:bigmac',                    maxStaleMin: 10080 }, // weekly seed; 10080 = 7 days
@@ -521,11 +545,12 @@ const SEED_META = {
   nationalDebt:        { key: 'seed-meta:economic:national-debt',              maxStaleMin: 86400 }, // monthly seed (seed-bundle-macro intervalMs: 30 * DAY); 60d = 2x interval absorbs one missed run. Prior 10080 (7d) was narrower than the cron interval so every cron past day 7 alarmed STALE_SEED.
   tariffTrendsUs:      { key: 'seed-meta:trade:tariffs:v1:840:all:10',        maxStaleMin: 540 }, // co-pinned to TARIFF_TTL (8h=480min) + 60min grace. Prior 900 (15h) created an 8h-15h silent window where data had expired but seed-meta was still considered fresh, masking real outages as status=EMPTY (not STALE_SEED). See scripts/seed-supply-chain-trade.mjs TARIFF_TTL.
   // publish.ts runs once daily (02:30 UTC); seed-meta TTL=52h — maxStaleMin must cover the full 24h cycle
-  consumerPricesOverview:   { key: 'seed-meta:consumer-prices:overview:ae',     maxStaleMin: 1500 }, // 25h = 24h cadence + 1h grace
+  consumerPricesOverview:   { key: 'seed-meta:consumer-prices:overview:ae',     maxStaleMin: 1500, minSuccessRate: 0.5 }, // 25h = 24h cadence + 1h grace; warn when <50% snapshots succeeded
   consumerPricesCategories: { key: 'seed-meta:consumer-prices:categories:ae:30d',            maxStaleMin: 1500 },
   consumerPricesMovers:     { key: 'seed-meta:consumer-prices:movers:ae:30d',               maxStaleMin: 1500 },
   consumerPricesSpread:     { key: 'seed-meta:consumer-prices:retailer-spread:ae:essentials-ae', maxStaleMin: 1500 },
   consumerPricesFreshness:  { key: 'seed-meta:consumer-prices:freshness:ae',    maxStaleMin: 1500 },
+  consumerPricesCoverage:   { key: 'seed-meta:consumer-prices:coverage:ae',      maxStaleMin: 1500, minSuccessRate: 0.5, requireCoverage: true },
   // defiTokens/aiTokens/otherTokens all share one seed run (seed-token-panels cron, every 30min)
   defiTokens:        { key: 'seed-meta:market:token-panels', maxStaleMin: 90 },
   aiTokens:          { key: 'seed-meta:market:token-panels', maxStaleMin: 90 },
@@ -641,6 +666,23 @@ const SEED_META = {
   intelHistoryIngestMilitaryCrossStrait: { key: 'seed-meta:intel-history:military:cross-strait-activity',  maxStaleMin: 720 }, // mirrors crossStraitActivity
   intelHistoryIngestEnergyIntelligence:  { key: 'seed-meta:intel-history:energy:intelligence',             maxStaleMin: 720 }, // mirrors energyIntelligence
 };
+
+// consumer-prices-core publishes coverage for every currently enabled market.
+// The Edge health registry cannot import the package YAML, so keep this small
+// list synchronized with consumer-prices-core/configs/retailers/*.yaml. AE keeps
+// its historical public health name; the other markets use explicit suffixes.
+const CONSUMER_PRICE_HEALTH_MARKETS = Object.freeze(['ae', 'au', 'br', 'gb', 'in', 'sa', 'sg', 'us']);
+for (const market of CONSUMER_PRICE_HEALTH_MARKETS) {
+  if (market === 'ae') continue;
+  const name = `consumerPricesCoverage${market.toUpperCase()}`;
+  BOOTSTRAP_KEYS[name] = `consumer-prices:coverage:${market}`;
+  SEED_META[name] = {
+    key: `seed-meta:consumer-prices:coverage:${market}`,
+    maxStaleMin: 1500,
+    minSuccessRate: 0.5,
+    requireCoverage: true,
+  };
+}
 
 // Iran-events sunset: when disabled (default), drop it from all health
 // classification so the deliberately-dormant manual seed can't raise
@@ -905,12 +947,12 @@ function keyHasData(redisKey, len) {
 
 function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
   if (!seedCfg) {
-    return { hasMeta: false, seedAge: null, seedStale: null, seedError: false, sourceUnavailable: false, sourceBlocked: false, metaReadFailed: false, metaCount: null, contentAge: null };
+    return { hasMeta: false, seedAge: null, seedStale: null, seedError: false, sourceUnavailable: false, sourceBlocked: false, metaReadFailed: false, metaCount: null, contentAge: null, coverage: null, synthesisFailure: null };
   }
   // Per-command Redis errors on the GET seed-meta half of the pipeline must
   // not silently fall through to STALE_SEED — promote to REDIS_PARTIAL.
   if (keyMetaErrors.get(seedCfg.key)) {
-    return { hasMeta: false, seedAge: null, seedStale: null, seedError: false, sourceUnavailable: false, sourceBlocked: false, metaReadFailed: true, metaCount: null, contentAge: null };
+    return { hasMeta: false, seedAge: null, seedStale: null, seedError: false, sourceUnavailable: false, sourceBlocked: false, metaReadFailed: true, metaCount: null, contentAge: null, coverage: null, synthesisFailure: null };
   }
   // Unwrap through the envelope helper. Legacy seed-meta is a bare
   // `{ fetchedAt, recordCount, sourceVersion, status? }` object with no `_seed`
@@ -919,6 +961,7 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
   // the dependency so behavior stays byte-identical in PR 1.
   const meta = unwrapEnvelope(parseRedisValue(keyMetaValues.get(seedCfg.key))).data;
   const metaCount = meta?.count ?? meta?.recordCount ?? null;
+  const poolCounts = parsePoolCounts(meta?.poolCounts, seedCfg.minPoolCounts);
   const errorCode = typeof meta?.errorCode === 'string'
     && /^[A-Z0-9_]{1,64}$/.test(meta.errorCode)
     ? meta.errorCode
@@ -933,8 +976,11 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
       sourceBlocked: false,
       metaReadFailed: false,
       metaCount,
+      poolCounts,
       contentAge: null,
+      coverage: null,
       errorCode,
+      synthesisFailure: null,
     };
   }
   let seedAge = null;
@@ -988,6 +1034,71 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
       contentStale: contentAgeMin == null || isFutureDated || contentAgeMin > meta.maxContentAgeMin,
     };
   }
+  // Per-market coverage: optional { status, completedPages, failedPages, completionRatio, rejectedCount, retailers }
+  // written by consumer-prices publish.ts and other seeders that track partial completion.
+  // null when the seeder didn't write coverage fields.
+  const coverageRetailers = Array.isArray(meta?.coverage?.retailers)
+    ? meta.coverage.retailers.slice(0, 100).map((retailer) => ({
+        slug: typeof retailer?.slug === 'string' ? retailer.slug.slice(0, 80) : null,
+        name: typeof retailer?.name === 'string' ? retailer.name.slice(0, 120) : null,
+        coverageStatus: typeof retailer?.coverageStatus === 'string' ? retailer.coverageStatus : 'unknown',
+        pagesAttempted: Number(retailer?.pagesAttempted) || 0,
+        pagesSucceeded: Number(retailer?.pagesSucceeded) || 0,
+        failedPages: Number(retailer?.failedPages) || 0,
+        rejectedCount: Number(retailer?.rejectedCount) || 0,
+        completionRatio: retailer?.completionRatio == null ? null : Number(retailer.completionRatio) || 0,
+      }))
+    : null;
+  const coverage = meta?.coverage && typeof meta.coverage === 'object'
+    ? {
+        status: typeof meta.coverage.status === 'string' ? meta.coverage.status : null,
+        completedPages: Number(meta.coverage.completedPages) || 0,
+        failedPages: Number(meta.coverage.failedPages) || 0,
+        completionRatio: meta.coverage.completionRatio == null ? null : Number(meta.coverage.completionRatio) || 0,
+        rejectedCount: Number(meta.coverage.rejectedCount) || 0,
+        retailers: coverageRetailers,
+      }
+    : null;
+
+  let synthesisFailure = null;
+  if (seedCfg.synthesisFailure) {
+    const consecutiveFailures = Number.isInteger(meta?.consecutiveFailures)
+      && meta.consecutiveFailures >= 0
+      ? Math.min(meta.consecutiveFailures, 100)
+      : 0;
+    const lastAttemptAt = Number.isFinite(Number(meta?.lastAttemptAt)) && Number(meta.lastAttemptAt) > 0
+      ? Number(meta.lastAttemptAt)
+      : null;
+    const lastSuccessAt = Number.isFinite(Number(meta?.lastSuccessAt)) && Number(meta.lastSuccessAt) > 0
+      ? Number(meta.lastSuccessAt)
+      : null;
+    const synthesisFailureAgeMin = lastAttemptAt == null
+      ? null
+      : Math.round((now - lastAttemptAt) / 60_000);
+    const lastSynthesisFailureCode = typeof meta?.lastSynthesisFailureCode === 'string'
+      && /^INSIGHTS_SYNTHESIS_(PARSE|GATE|MISSING_CLUSTER|PROVIDER)$/.test(meta.lastSynthesisFailureCode)
+      ? meta.lastSynthesisFailureCode
+      : null;
+    const servedGeneratedAt = typeof meta?.servedGeneratedAt === 'string'
+      && meta.servedGeneratedAt.length <= 64
+      ? meta.servedGeneratedAt
+      : null;
+    const warning = consecutiveFailures > 0 && (
+      consecutiveFailures >= seedCfg.synthesisFailure.warnAfterConsecutive
+      || (synthesisFailureAgeMin != null
+        && synthesisFailureAgeMin >= seedCfg.synthesisFailure.warnAfterAgeMin)
+      || (seedCfg.synthesisFailure.warnWithoutSuccess && lastSuccessAt == null)
+    );
+    synthesisFailure = {
+      consecutiveFailures,
+      lastAttemptAt,
+      lastSuccessAt,
+      servedGeneratedAt,
+      synthesisFailureAgeMin,
+      lastSynthesisFailureCode,
+      warning,
+    };
+  }
   return {
     hasMeta: meta != null,
     seedAge,
@@ -997,8 +1108,11 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
     sourceBlocked,
     metaReadFailed: false,
     metaCount,
+    poolCounts,
     contentAge,
+    coverage,
     errorCode,
+    synthesisFailure,
   };
 }
 
@@ -1042,8 +1156,11 @@ function classifyKey(name, redisKey, opts, ctx) {
     sourceUnavailable,
     sourceBlocked,
     metaCount,
+    poolCounts,
     contentAge,
+    coverage,
     errorCode,
+    synthesisFailure,
   } = meta;
 
   // When the data key is gone the meta count is meaningless; force records=0
@@ -1064,6 +1181,7 @@ function classifyKey(name, redisKey, opts, ctx) {
     status = 'SEED_ERROR';
   }
   else if (sourceBlocked && hasData && records > 0 && seedStale !== true) status = 'SOURCE_BLOCKED';
+  else if (synthesisFailure?.warning) status = 'SEED_ERROR';
   else if (seedError) status = 'SEED_ERROR';
   else if (!hasData) {
     if (cascadeCovered) status = 'OK_CASCADE';
@@ -1084,6 +1202,24 @@ function classifyKey(name, redisKey, opts, ctx) {
   // to COVERAGE_PARTIAL (warn) instead of reporting OK. Producer must write
   // seed-meta.recordCount using the *covered* count, not the shape size.
   else if (seedCfg?.minRecordCount != null && records < seedCfg.minRecordCount) status = 'COVERAGE_PARTIAL';
+  // Per-pool coverage is independent of aggregate volume. Missing/malformed
+  // diagnostics fail closed: without all configured counts health cannot prove
+  // that every category consumer has data.
+  else if (hasPoolCoverageShortfall(poolCounts, seedCfg?.minPoolCounts)) status = 'COVERAGE_PARTIAL';
+  // Success-rate threshold: when the producer writes coverage.completionRatio
+  // (consumer-prices publish.ts etc.), flag COVERAGE_DEGRADED if the ratio
+  // falls below minSuccessRate. Fires after COVERAGE_PARTIAL so record-count
+  // shortfalls take precedence.
+  else if (seedCfg?.requireCoverage && !coverage) status = 'COVERAGE_DEGRADED';
+  else if (
+    seedCfg?.minSuccessRate != null
+    && coverage
+    && (coverage.completionRatio < seedCfg.minSuccessRate || coverage.status === 'degraded')
+  ) status = 'COVERAGE_DEGRADED';
+  else if (
+    coverage
+    && (coverage.status === 'partial' || coverage.retailers?.some((retailer) => retailer.coverageStatus === 'failed'))
+  ) status = 'COVERAGE_PARTIAL';
   // Content-age check (opt-in via runSeed contentMeta + maxContentAgeMin).
   // Fires AFTER all earlier failure paths so STALE_SEED, COVERAGE_PARTIAL,
   // EMPTY_*, etc. take precedence — STALE_CONTENT is "the seeder is healthy
@@ -1111,6 +1247,9 @@ function classifyKey(name, redisKey, opts, ctx) {
   if (seedAge !== null) entry.seedAgeMin = seedAge;
   if (seedCfg) entry.maxStaleMin = seedCfg.maxStaleMin;
   if (seedCfg?.minRecordCount != null) entry.minRecordCount = seedCfg.minRecordCount;
+  if (seedCfg?.minPoolCounts) entry.minPoolCounts = seedCfg.minPoolCounts;
+  if (poolCounts) entry.poolCounts = poolCounts;
+  if (coverage || seedCfg?.requireCoverage) entry.coverage = coverage;
   if (status === 'SEED_ERROR' && errorCode) entry.errorCode = errorCode;
   // Surface content-age fields when seeder opted in (presence of
   // meta.maxContentAgeMin). Operators can distinguish "stale content" from
@@ -1118,6 +1257,20 @@ function classifyKey(name, redisKey, opts, ctx) {
   if (contentAge) {
     entry.contentAgeMin = contentAge.contentAgeMin;          // null when contentMeta returned null
     entry.maxContentAgeMin = contentAge.maxContentAgeMin;
+  }
+  if (synthesisFailure) {
+    entry.consecutiveFailures = synthesisFailure.consecutiveFailures;
+    if (synthesisFailure.lastAttemptAt != null) entry.lastAttemptAt = synthesisFailure.lastAttemptAt;
+    if (synthesisFailure.lastSuccessAt != null || synthesisFailure.consecutiveFailures > 0) {
+      entry.lastSuccessAt = synthesisFailure.lastSuccessAt;
+    }
+    if (synthesisFailure.servedGeneratedAt != null) entry.servedGeneratedAt = synthesisFailure.servedGeneratedAt;
+    if (synthesisFailure.synthesisFailureAgeMin != null && synthesisFailure.consecutiveFailures > 0) {
+      entry.synthesisFailureAgeMin = synthesisFailure.synthesisFailureAgeMin;
+    }
+    if (status === 'SEED_ERROR' && synthesisFailure.lastSynthesisFailureCode) {
+      entry.lastSynthesisFailureCode = synthesisFailure.lastSynthesisFailureCode;
+    }
   }
   return entry;
 }
@@ -1141,6 +1294,7 @@ const STATUS_COUNTS = {
   EMPTY_ON_DEMAND: 'warn',
   REDIS_PARTIAL: 'warn',
   COVERAGE_PARTIAL: 'warn',
+  COVERAGE_DEGRADED: 'warn',
   // Content-age signal — seeder is healthy but upstream stopped publishing.
   // Operator can't fix upstream cadence, so de-rank vs. STALE_SEED in alerting
   // (both bucket to 'warn' — overall status is `degraded`, not `critical`).

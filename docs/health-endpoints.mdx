@@ -59,6 +59,16 @@ Primary health endpoint. Checks all Redis-backed data keys and seed freshness me
 
 With `?compact=1`, the `checks` object is replaced by `problems` containing only non-OK keys.
 
+### Consumer-price source coverage
+
+The consumer-prices-core service exposes `GET /wm/consumer-prices/v1/coverage?market=ae` (the service API key is required). Its response includes attempted, completed, failed, and validator-rejected page counts for the market and each active retailer. `status` is `healthy`, `partial`, or `degraded`; a partial result remains publishable, while a rejected observation is never admitted merely to improve the coverage count. The publisher writes the same snapshot to `consumer-prices:coverage:<market>` and includes its aggregate completion ratio in `seed-meta`, so `/api/health` can distinguish a fresh partial run from a stopped producer.
+
+This operational contract complements, rather than replaces, the source-quality work in [#5445](https://github.com/koala73/worldmonitor/issues/5445) and [#5811](https://github.com/koala73/worldmonitor/issues/5811).
+
+### Relay ingestion telemetry
+
+The relay's public `GET /health` keeps the top-level `status: "ok"` contract for process-liveness probes. Its nested `ingestion.status` is the application-level verdict: it becomes `degraded` when aviation or RSS served coverage falls below its configured floor, or when AIS snapshot requests have no served snapshot. `GET /metrics` exposes the rolling-window per-route counters for success, throttle, timeout, authentication rejection, fallback, terminal failure, served coverage, cooldowns, and RSS feed backoff. AIS snapshot `unauthorizedClient` is tracked separately from upstream authentication failures so client traffic cannot be mistaken for provider health.
+
 ### Key Classifications
 
 Keys are grouped into three tiers that determine alert severity:
@@ -79,7 +89,7 @@ Keys are grouped into three tiers that determine alert severity:
 | `SOURCE_BLOCKED` | Green | The Japan MOD adapter proved no transport path reaches the publisher while retaining fresh reviewed records — either an upstream HTTP 403 after a successful proxy CONNECT (`HTTP_403`), or a target-scoped proxy CONNECT refusal corroborated by a successful control tunnel (`PROXY_TARGET_FORBIDDEN`). Uncorroborated CONNECT refusals, stale, empty, or unreviewed states still fail closed |
 | `STALE_SEED` | Warn | Data present but `seed-meta` age exceeds `maxStaleMin` |
 | `STALE_CONTENT` | Warn | Seeder is fresh but the upstream content stopped advancing (frozen feed); counted in `summary.staleContent` |
-| `COVERAGE_PARTIAL` | Warn | Record count is below the key's declared `minRecordCount` (e.g. 10/13 chokepoints or 139/174 PortWatch port-activity countries) |
+| `COVERAGE_PARTIAL` | Warn | Aggregate records or a required subgroup is below the key's declared coverage floor (for example, 139/174 PortWatch countries or an empty prediction-market pool) |
 | `SEED_ERROR` | Warn | `seed-meta` reports `status: "error"` from the last seed run |
 | `REDIS_PARTIAL` | Warn | A single per-command Redis error on this key's STRLEN/GET (not a full outage) |
 | `EMPTY_ON_DEMAND` | Warn | On-demand key has no data yet (expected until first request); counted in `summary.onDemandWarn` |
@@ -164,6 +174,11 @@ health entries where those feeds publish seed metadata.
 PortWatch cache entries, but the canonical country list and healthy seed-meta
 signal do not advance until full 174-country coverage returns.
 
+`predictionMarkets` also requires at least one published market in each
+`geopolitical`, `tech`, and `finance` pool. Its seed metadata publishes
+`poolCounts`; missing, malformed, or under-floor counts report
+`COVERAGE_PARTIAL` even when the aggregate market count is healthy.
+
 ### Staleness Thresholds (maxStaleMin)
 
 Selected thresholds from `SEED_META`:
@@ -246,6 +261,25 @@ Focused endpoint for seed loop freshness. Checks only `seed-meta:*` keys without
       "sourceVersion": null,
       "ageMinutes": 5,
       "stale": true
+    },
+    "prediction:markets": {
+      "status": "coverage_partial",
+      "fetchedAt": 1710158100000,
+      "recordCount": 87,
+      "poolCounts": {
+        "geopolitical": 52,
+        "tech": 0,
+        "finance": 35
+      },
+      "minPoolCounts": {
+        "geopolitical": 1,
+        "tech": 1,
+        "finance": 1
+      },
+      "coveragePartial": true,
+      "sourceVersion": null,
+      "ageMinutes": 5,
+      "stale": false
     }
   }
 }
@@ -253,7 +287,9 @@ Focused endpoint for seed loop freshness. Checks only `seed-meta:*` keys without
 
 ### Staleness Logic
 
-A seed is considered stale when its age exceeds **2x the configured interval**. This accounts for normal jitter in cron/relay timing. Seeds with an explicit `minRecordCount` also report `coverage_partial` and `stale: true` until their coverage floor is met.
+A seed is considered stale when its age exceeds **2x the configured interval**. This accounts for normal jitter in cron/relay timing. Seeds below an aggregate `minRecordCount` report `coverage_partial` and `stale: true`. Seeds below a subgroup floor such as prediction-market `minPoolCounts` also report `coverage_partial`, but retain `stale: false` while their producer heartbeat remains fresh so freshness and coverage stay distinct.
+
+**Consumers:** treat `status` and `overall` as authoritative for coverage. Do not rely on `stale` alone — pool shortfalls keep `stale: false` by design. When either coverage floor fails, the entry also sets `coveragePartial: true` so clients that only inspect booleans still see the shortfall.
 
 | Domain | Interval (min) | Stale After (min) |
 |--------|---------------|-------------------|

@@ -17,6 +17,8 @@ const deployGateWorkflow = read(resolve(workflowsDir, 'deploy-gate.yml'));
 const securityAuditWorkflow = read(resolve(workflowsDir, 'security-audit.yml'));
 const securityAuditScript = read(resolve(root, '.github/scripts/audit-production-dependencies.mjs'));
 const testWorkflow = read(resolve(workflowsDir, 'test.yml'));
+const desktopBuildWorkflow = read(resolve(workflowsDir, 'build-desktop.yml'));
+const desktopCanaryWorkflow = read(resolve(workflowsDir, 'test-linux-app.yml'));
 const lintCodeWorkflow = read(resolve(workflowsDir, 'lint-code.yml'));
 const workflowText = readdirSync(workflowsDir)
   .filter((name) => name.endsWith('.yml') || name.endsWith('.yaml'))
@@ -38,6 +40,8 @@ const REQUIRED_TEST_JOBS = [
   'convex-tests',
   'variant-smoke-full',
   'resilience-validation-smoke',
+  'desktop-config',
+  'desktop-rust',
 ] as const;
 
 const TIMEOUT_CAPPED_TEST_JOBS = [
@@ -46,6 +50,8 @@ const TIMEOUT_CAPPED_TEST_JOBS = [
   'convex-tests',
   'variant-smoke-full',
   'resilience-validation-smoke',
+  'desktop-config',
+  'desktop-rust',
 ] as const;
 
 const REQUIRED_GATE_WORKFLOWS = ['Test', 'Typecheck', 'Lint Code', 'Security Audit'] as const;
@@ -83,12 +89,40 @@ const REQUIRED_RESILIENCE_VALIDATION_INPUTS = [
   'scripts/_bundle-runner.mjs',
 ] as const;
 
+// Desktop drift gates (#5902): the literal awk patterns each change filter
+// must keep, so a filter refactor cannot silently un-gate a desktop-breaking
+// path class (the exact drift class #5902 exists to close).
+const REQUIRED_DESKTOP_CONFIG_INPUTS = [
+  'src-tauri/',
+  'package.json',
+  'scripts/repack-linux-appimage.sh',
+  'scripts/sync-desktop-version.mjs',
+  'scripts/check-desktop-build-env.mjs',
+  'scripts/check-rust-security-floors.mjs',
+] as const;
+
+const REQUIRED_DESKTOP_RUST_INPUTS = [
+  'src-tauri/sidecar/',
+  'src-tauri/',
+  '.github/workflows/test.yml',
+] as const;
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function workflowRegexNeedle(path: string): string {
   return path.replaceAll('/', '\\/').replaceAll('.', '\\.');
+}
+
+function shellAwkAssignmentBlock(variable: string): string {
+  const start = `${variable}=$(echo "$FILES" | awk '`;
+  const startIndex = testWorkflow.indexOf(start);
+  assert.notEqual(startIndex, -1, `test.yml must define ${variable}`);
+  const end = "\n          ')";
+  const endIndex = testWorkflow.indexOf(end, startIndex);
+  assert.notEqual(endIndex, -1, `test.yml must terminate ${variable}`);
+  return testWorkflow.slice(startIndex, endIndex + end.length);
 }
 
 function testJobBlock(job: string): string {
@@ -101,6 +135,45 @@ function workflowJobBlock(workflow: string, job: string): string {
   const match = workflow.match(new RegExp(`\\n  ${escapeRegExp(job)}:\\n[\\s\\S]*?(?=\\n  [\\w-]+:\\n|\\n$)`));
   assert.ok(match, `workflow must define ${job}`);
   return match[0];
+}
+
+function workflowStepBlock(workflow: string, stepName: string): string {
+  const marker = `\n      - name: ${stepName}\n`;
+  const startIndex = workflow.indexOf(marker);
+  assert.notEqual(startIndex, -1, `workflow must define step ${stepName}`);
+  const nextStepIndex = workflow.indexOf('\n      - ', startIndex + marker.length);
+  return workflow.slice(startIndex, nextStepIndex === -1 ? workflow.length : nextStepIndex);
+}
+
+function workflowRunScript(stepBlock: string): string {
+  const marker = '\n        run: |\n';
+  const startIndex = stepBlock.indexOf(marker);
+  assert.notEqual(startIndex, -1, 'workflow step must have a block run script');
+  return stepBlock
+    .slice(startIndex + marker.length)
+    .split('\n')
+    .map((line) => line.replace(/^ {10}/, ''))
+    .join('\n');
+}
+
+function runReleasePreflight(stepBlock: string, eventName: string, draft: string, value: string): void {
+  const script = workflowRunScript(stepBlock)
+    .replaceAll('${{ github.event_name }}', eventName)
+    .replaceAll('${{ github.event.inputs.draft }}', draft);
+  const names = [
+    'VITE_CLERK_PUBLISHABLE_KEY',
+    'VITE_WS_RELAY_URL',
+    'VITE_PMTILES_URL_PUBLIC',
+    'CONVEX_URL',
+  ];
+  const env = Object.fromEntries(names.map((name) => [name, value]));
+  execFileSync('bash', ['-e', '-o', 'pipefail', '-c', script], { env, encoding: 'utf8' });
+}
+
+function evaluateDesktopConfigFilter(filter: string, files: string[]): string {
+  const fileArgs = files.map((file) => JSON.stringify(file)).join(' ');
+  const script = `FILES=$(printf '%s\\n' ${fileArgs}); ${filter}; printf '%s' "$DESKTOP_CONFIG"`;
+  return execFileSync('bash', ['-euo', 'pipefail', '-c', script], { encoding: 'utf8' }).trim();
 }
 
 function workflowJobNames(workflow: string, label: string): string[] {
@@ -430,6 +503,183 @@ describe('CI workflow coverage', () => {
     for (const input of REQUIRED_RESILIENCE_VALIDATION_INPUTS) {
       assert.ok(testWorkflow.includes(workflowRegexNeedle(input)), `test.yml must cover ${input}`);
     }
+  });
+
+  it('keeps desktop drift-gate inputs in the CI change filter (#5902)', () => {
+    assert.ok(
+      testWorkflow.includes('desktop_config: ${{ steps.diff.outputs.desktop_config }}'),
+      'test.yml must expose a desktop_config change output',
+    );
+    assert.ok(
+      testWorkflow.includes('desktop_rust: ${{ steps.diff.outputs.desktop_rust }}'),
+      'test.yml must expose a desktop_rust change output',
+    );
+    const desktopConfigFilter = shellAwkAssignmentBlock('DESKTOP_CONFIG');
+    const desktopRustFilter = shellAwkAssignmentBlock('DESKTOP_RUST');
+    for (const input of REQUIRED_DESKTOP_CONFIG_INPUTS) {
+      assert.ok(
+        desktopConfigFilter.includes(workflowRegexNeedle(input)),
+        `test.yml desktop_config filter must cover ${input}`,
+      );
+    }
+    assert.ok(
+      desktopConfigFilter.includes('/^\\.github\\/workflows\\/.*\\.ya?ml$/'),
+      'test.yml desktop_config filter must cover every workflow file for dynamic Tauri inventory',
+    );
+    assert.equal(
+      evaluateDesktopConfigFilter(desktopConfigFilter, ['.github/workflows/nightly.yaml']),
+      '1',
+      'desktop_config must trigger for a newly added workflow file',
+    );
+    assert.equal(
+      evaluateDesktopConfigFilter(desktopConfigFilter, ['src/app.ts']),
+      '0',
+      'desktop_config must not trigger for an unrelated source file',
+    );
+    for (const input of REQUIRED_DESKTOP_RUST_INPUTS) {
+      assert.ok(
+        desktopRustFilter.includes(workflowRegexNeedle(input)),
+        `test.yml desktop_rust filter must cover ${input}`,
+      );
+    }
+    assert.match(
+      testJobBlock('desktop-config'),
+      /if: needs\.changes\.outputs\.desktop_config == 'true'/,
+      'desktop-config job must use the desktop_config change output',
+    );
+    // Cargo.lock is the only thing that decides which crate versions ship, and
+    // no other job inspects it (security-audit covers npm lockfiles only), so
+    // dropping this step would let a cargo update silently reintroduce a known
+    // advisory — CVE-2026-42184 / #5518 is the case that motivated it.
+    const floorStep = workflowStepBlock(testWorkflow, 'Rust dependency security floors (#5518)');
+    assert.match(
+      floorStep,
+      /^\s+run: node scripts\/check-rust-security-floors\.mjs\s*$/m,
+      'desktop-config job must run the Rust dependency security-floor check',
+    );
+    // A presence-only assertion would stay green with the step neutered, so
+    // pin that it still fails the job (same guard the AppImage step carries).
+    assert.doesNotMatch(floorStep, /^\s+continue-on-error:/m);
+    const releaseFloorStep = workflowStepBlock(desktopBuildWorkflow, 'Rust dependency security floors (#5518)');
+    assert.match(
+      releaseFloorStep,
+      /^\s+run: node scripts\/check-rust-security-floors\.mjs\s*$/m,
+      'release workflow must verify the security floors of the lockfile it ships',
+    );
+    assert.doesNotMatch(releaseFloorStep, /^\s+continue-on-error:/m);
+    assert.match(
+      testJobBlock('desktop-rust'),
+      /if: needs\.changes\.outputs\.desktop_rust == 'true'/,
+      'desktop-rust job must use the desktop_rust change output',
+    );
+    // The sidecar handler bundle build must live in the `unit` job: its
+    // esbuild input graph spans src/ and server/ via the @/ alias, and only
+    // the `code` filter tracks that whole surface (#5902). A refactor moving
+    // it back to a narrower path-gated job would silently re-open the
+    // "bundle-breaking change with green PR CI" gap.
+    assert.match(
+      testJobBlock('unit'),
+      /^\s+node scripts\/build-sidecar-handlers\.mjs\s*$/m,
+      'unit job must run the sidecar handler bundle build',
+    );
+    // Desktop build env parity (#5905) runs in BOTH legs deliberately:
+    // desktop-config fires on workflow edits (build-desktop.yml is excluded
+    // from the `code` filter), while unit fires when src/ gains a new
+    // import.meta.env.VITE_ read. Dropping either leg reopens half the gap.
+    assert.match(
+      testJobBlock('desktop-config'),
+      /^\s+run: node scripts\/check-desktop-build-env\.mjs\s*$/m,
+      'desktop-config job must run the desktop build env parity check',
+    );
+    assert.match(
+      testJobBlock('unit'),
+      /^\s+run: node scripts\/check-desktop-build-env\.mjs\s*$/m,
+      'unit job must run the desktop build env parity check',
+    );
+    const releasePreflight = workflowStepBlock(desktopBuildWorkflow, 'Release client-env preflight (#5905)');
+    assert.match(releasePreflight, /\[ "\$\{\{ github\.event_name \}\}" = "push" \] \|\|/);
+    assert.match(releasePreflight, /\[ "\$\{\{ github\.event_name \}\}" = "workflow_dispatch" \]/);
+    assert.match(releasePreflight, /\[ "\$\{\{ github\.event\.inputs\.draft \}\}" != "true" \]/);
+    assert.doesNotMatch(releasePreflight, /VITE_VAPID_PUBLIC_KEY/);
+    const canaryPreflight = workflowStepBlock(desktopCanaryWorkflow, 'Client env preflight (#5905)');
+    assert.match(canaryPreflight, /requires non-empty client env/);
+    assert.match(canaryPreflight, /VITE_CLERK_PUBLISHABLE_KEY/);
+    assert.match(canaryPreflight, /VITE_CONVEX_URL/);
+    assert.doesNotMatch(canaryPreflight, /VITE_VAPID_PUBLIC_KEY/);
+    assert.throws(
+      () => runReleasePreflight(releasePreflight, 'push', '', ''),
+      (error) => error.status === 1,
+      'tag pushes must fail when client env secrets are empty',
+    );
+    assert.throws(
+      () => runReleasePreflight(releasePreflight, 'workflow_dispatch', 'false', ''),
+      (error) => error.status === 1,
+      'published manual dispatches must fail when client env secrets are empty',
+    );
+    assert.doesNotThrow(
+      () => runReleasePreflight(releasePreflight, 'workflow_dispatch', 'true', ''),
+      'draft manual dispatches may run with empty client env secrets',
+    );
+    assert.doesNotThrow(
+      () => runReleasePreflight(releasePreflight, 'push', '', 'configured'),
+      'populated tag releases must pass the client env preflight',
+    );
+    for (const variant of ['full', 'tech', 'finance'] as const) {
+      assert.match(
+        packageScripts[`desktop:build:${variant}`] ?? '',
+        /npm run desktop:check-env/,
+        `desktop:build:${variant} must run the local desktop env gate`,
+      );
+    }
+    const releasePostProcess = workflowStepBlock(desktopBuildWorkflow, 'Strip GPU libraries from AppImage');
+    assert.match(
+      releasePostProcess,
+      /^\s+bash scripts\/repack-linux-appimage\.sh "\$APPIMAGE" "\$TOOL_ARCH"\s*$/m,
+      'release workflow must apply the shared AppImage post-processing',
+    );
+    assert.match(releasePostProcess, /^\s+if: contains\(matrix\.platform, 'ubuntu'\)\s*$/m);
+    assert.doesNotMatch(releasePostProcess, /^\s+continue-on-error:/m);
+    const canaryPostProcess = workflowStepBlock(
+      desktopCanaryWorkflow,
+      'Apply release AppImage post-processing',
+    );
+    assert.match(
+      canaryPostProcess,
+      /^\s+bash scripts\/repack-linux-appimage\.sh "\$\{IMAGES\[0]}" x86_64\s*$/m,
+      'desktop canary must smoke-test the release-processed AppImage',
+    );
+    assert.doesNotMatch(canaryPostProcess, /^\s+(?:if|continue-on-error):/m);
+    const desktopCanarySmoke = workflowStepBlock(desktopCanaryWorkflow, 'Smoke-test AppImage');
+    assert.doesNotMatch(desktopCanarySmoke, /^\s+continue-on-error:/m);
+    assert.match(
+      desktopCanarySmoke,
+      /if CODE=\$\(curl[\s\S]{0,200}\[\[ "\$CODE" =~ \^\[1-5]\[0-9]\[0-9]\$ \]\]; then/,
+      'desktop canary readiness must require curl success and a real HTTP status',
+    );
+    assert.match(
+      desktopCanarySmoke,
+      /if FINAL_CODE=\$\(curl[\s\S]{0,200}\[\[ "\$FINAL_CODE" =~ \^\[1-5]\[0-9]\[0-9]\$ \]\]; then/,
+      'desktop canary must re-probe sidecar liveness after the observation window',
+    );
+    assert.ok(
+      desktopCanarySmoke.indexOf('if kill -0 "$APP_PID"') >
+        desktopCanarySmoke.indexOf('if FINAL_CODE=$(curl'),
+      'desktop canary must check app liveness after the final sidecar probe',
+    );
+    assert.match(
+      desktopCanarySmoke,
+      /^\s+if grep -q "SIDECAR_FINAL_STATUS=alive" \/tmp\/display-server\.log 2>\/dev\/null; then\s*$/m,
+      'desktop canary must gate success on final sidecar liveness',
+    );
+  });
+
+  it('runs workflow coverage when the release workflow changes', () => {
+    const codeFilter = shellAwkAssignmentBlock('CODE');
+    assert.doesNotMatch(
+      codeFilter,
+      /build-desktop\.yml/,
+      'build-desktop.yml changes must run the unit workflow-coverage assertions',
+    );
   });
 
   it('runs scheduled and per-PR production dependency audits for every package lockfile', () => {
