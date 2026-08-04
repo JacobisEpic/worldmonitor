@@ -26,7 +26,7 @@
 
 ## Deployment safety guardrails
 
-### Watch paths are a live contract
+### Watch paths are a live contract, and an unreliable one
 
 Railway stores watch paths in each service's environment configuration, not in
 the repository. The repo-side contract is
@@ -34,8 +34,31 @@ the repository. The repo-side contract is
 its cron and the exact repository-relative files in its runtime dependency
 closure. `tests/railway-watch-path-audit.test.mjs` walks each entry point's
 imports and fails when that closure grows without a matching registry update.
-This keeps a helper change deployable without making unrelated changes under
+This keeps the declared closure complete without making unrelated changes under
 `scripts/**` or `shared/**` rebuild every seeder.
+
+**A complete closure does not make the filter reliable.** Railway refuses pushes
+that plainly match the glob and records the refusal only as a deployment whose
+status is `SKIPPED` and whose `meta.commitHash` carries the commit it refused.
+Measured 2026-08-04 against production, 62 of the 62 repository-backed services
+carrying a filter were behind a push Railway had refused, while
+13 of the 15 without one were at `origin/main` HEAD. Narrowness did not help:
+`seed-conflict-intel` pins the most careful closure in the fleet — 24 exact
+paths — and had its worst skip rate, 51% of its last 500 deployments.
+
+Clearing the filters fleet-wide was considered and rejected on cost: roughly 75
+build-minutes per push to main across 77 services at ~30 merges a day, and three
+always-on services (ais-relay, notification-relay, scenario-worker) would
+restart on every merge, dropping the AIS websocket connections among them. So
+the closures stay for now,
+what ships today is **detection** ([Deploy-drift check](#deploy-drift-check)
+below), and the permanent fix is to move change detection out of Railway
+entirely — compute which services' closures actually changed in CI and call
+`railway redeploy` for exactly those, so the matching happens in code we own and
+test. That is tracked in
+[#6142](https://github.com/koala73/worldmonitor/issues/6142). The full
+measurement and the history behind it are in
+[Railway watch paths skip deployments, however narrow the pattern](solutions/integration-issues/railway-seeder-watch-paths-can-skip-deployments.md).
 
 The always-on bootstrap publisher is the deliberate exception: its empty watch
 path list means Railway watches the whole repository. That broader trigger
@@ -60,16 +83,22 @@ To reconcile only drifted seeders and verify the read-back:
 node scripts/audit-railway-watch-paths.mjs --apply
 ```
 
-The apply mode changes only drifted `build.watchPatterns` and
-`deploy.cronSchedule` fields, uses one environment config commit, and waits for
+The apply mode changes only drifted `build.watchPatterns`,
+`build.dockerfilePath` and `deploy.cronSchedule` fields, uses one environment
+config commit, and waits for
 Railway's eventually consistent config read-back before reporting success. It
 does not assign a cron to explicitly always-on services such as the bootstrap
 publisher, while still auditing their watch paths and required environment.
 Run the audit after adding or replacing a standalone seeder, changing a bundle
 dependency, or changing a production cron.
 
+The audit only proves the trigger config matches the registry. Proving a merge
+actually reached production is the separate
+[deploy-drift check](#deploy-drift-check) below.
+
 The scheduled operational-acceptance workflow performs the same audit in
-read-only mode before checking compact health. Create the dedicated GitHub
+read-only mode, then the deploy-drift check, before checking compact health.
+Create the dedicated GitHub
 Actions environment `ingestion-acceptance-production`, restrict its deployment
 branch policy to `main`, and configure:
 
@@ -147,7 +176,8 @@ status to be green; a missing, pending, or failed gate makes the workflow fail
 closed instead of producing a green skipped run. Manual runs execute directly.
 After the repository gate, the workflow checks live Railway watch paths, cron
 schedules, required routing variables, and service presence against
-`scripts/railway-services.json`, then checks public compact health. It fails on
+`scripts/railway-services.json`, then runs the deploy-drift check, then checks
+public compact health. It fails on
 every actionable problem, including `SEED_ERROR`, `STALE_SEED`,
 `STALE_CONTENT`, and degraded composed coverage. Statuses that explicitly end
 in `_ON_DEMAND` remain informational. It deliberately does not run on an
@@ -156,21 +186,68 @@ yet. This is the operational acceptance gate for the "merged and green, but
 production data is still unhealthy or running under stale deployment
 controls" gap.
 
+#### Deploy-drift check
+
+```bash
+node scripts/check-railway-deploy-drift.mjs        # add --json for the machine-readable form
+```
+
+The watch-path filter is one way a merge fails to reach production; a GitHub
+integration that stopped delivering (#6064) and a build that failed after the
+merge landed are others. This check is deliberately agnostic about which. For
+every service whose Railway source is this repository it takes the newest
+deployment that actually reached a running state, reads `meta.commitHash` off
+it, and compares that with main's head. Three verdicts are healthy — `CURRENT`,
+`AHEAD`, `PENDING_BUILD` — and the problem set is derived from them by negation,
+so the reported verdicts are `REJECTED_PUSH`, `BEHIND`, `BUILD_FAILED`,
+`UNKNOWN_SOURCE`, `UNKNOWN_STATUS`, `NO_DEPLOYMENTS`, `NO_BUILD_IN_WINDOW` and
+`QUERY_FAILED`. The file's header comment and exported constants are the exact
+semantics. `REJECTED_PUSH` is the filter rejection this runbook's watch-path
+section describes: the named SHAs are merges Railway refused.
+
+Ancestry is answered with `git merge-base --is-ancestor`, which needs the
+commits present locally: the workflow checks out with `fetch-depth: 50` and
+re-fetches main before the step. An unanswerable question reports the service
+rather than excusing it.
+
+Accepted degradations go in `scripts/railway-deploy-drift-baseline.json`, each
+with an owner issue and the whole file with an expiry, split by the same
+`applyAcceptanceBaseline` that `scripts/check-seed-freshness.mjs` applies to
+compact health — so expiry, prune-on-recovery, and "a service failing with a
+different verdict than the one baselined still blocks" cannot acquire two
+meanings. Today it holds the measured fleet: 62 `REJECTED_PUSH` entries against
+[#6142](https://github.com/koala73/worldmonitor/issues/6142) plus `umami` at
+`BEHIND` against #6064. Those are printed on every run as `acknowledged` and do
+not fail it, so a green monitor here means "nothing new went stale", not "every
+service is on head". The list should shrink as #6142 lands; a service that
+recovers is printed as `recovered` — prune it.
+
+#### Recovering a stale service
+
 Do not use `railway redeploy` to recover a bad or stale source deployment.
 Railway documents redeploy as rebuilding the most recent deployment with the
-same code, so it cannot pick up a newer fixed commit. From a clean checkout
-whose `HEAD` equals current `origin/main`, upload the current source instead:
+same code, so it cannot pick up a newer fixed commit. Upload the source from a
+**clean detached worktree at `origin/main`**, never from your own worktree:
+`railway up` uploads the current working directory, so an unclean one deploys
+uncommitted state to production.
 
 ```bash
 git fetch origin
-git rev-parse HEAD
-git rev-parse origin/main
+git worktree add --detach /tmp/railway-deploy origin/main
+cd /tmp/railway-deploy
+git rev-parse HEAD                       # must equal origin/main
 railway up --service <service-name> --environment production --detach
 ```
 
+An upload carries no commit SHA, so `check-railway-deploy-drift.mjs` reports
+that service as `UNKNOWN_SOURCE` until the next git-triggered build replaces it.
+That is expected after a recovery upload, not a second failure.
+
 Alternatively, Railway's dashboard **Deploy Latest Commit** action deploys the
-latest commit from the service's default GitHub branch. After either recovery
-path, verify the deployment commit SHA and the relevant compact-health problem
+latest commit from the service's default GitHub branch — preferable when the
+service's git source is healthy, because the resulting deployment carries a SHA
+the drift check can compare. After either recovery path, verify the deployment
+commit SHA and the relevant compact-health problem
 have both advanced. See Railway's official
 [redeploy CLI reference](https://docs.railway.com/cli/redeploy) and
 [deployment actions reference](https://docs.railway.com/deployments/deployment-actions).
@@ -431,6 +508,113 @@ continuous metric.
 | **Members** | Correlation (5min), Cross-Source Signals (15min), Cross-Strait Activity (3h), China Decision Signals (15min), Regional Snapshots (6h) |
 | **Required env** | `JAPAN_MOD_PROXY_URL` or `PROXY_URL` (Cross-Strait Activity's Japan MOD exit; the section declares an any-of group, so either satisfies it and only an environment with neither fails as `CONFIG_ERROR`) |
 | **Note** | Cross-Strait Activity is the only direct external-source member; it uses bounded MND/Japan MOD requests and a 3h freshness gate. China Decision Signals validates and republishes the bounded public composition after reading its domain lanes. Other members are Redis-derived. The bundle enforces a 570s wall-time admission budget so a non-fitting due section defers before Railway's 10-minute container limit. |
+
+#### Staged correlation runtime modes
+
+Correlation uses one Redis control key, `correlation:runtime-mode:v1`, whose
+value is a JSON object with one strict field, for example
+`{"mode":"legacy"}`, `{"mode":"exact"}`, or `{"mode":"fuzzy"}`.
+The browser reads the public `GET /api/correlation-runtime-mode` contract with
+`cache: "no-store"` at startup and before every correlation refresh. The
+correlation seeder reads the Redis key again on every compute cycle; it does not
+reuse a previous cycle's decision.
+
+Every missing key, malformed JSON or shape, unknown mode, missing Redis
+credentials, failed Redis request, non-OK browser response, or failed browser
+payload parse resolves to `legacy`. `legacy` remains the current keyword
+clustering behavior. Exact entity clustering and fuzzy resolution are staged
+follow-ups owned by #5984 and #5989; this control slice does not activate either
+mode or change live configuration.
+
+Changing the key is an operational activation or rollback and requires separate
+operator approval. Keep that approval, the observed validation evidence, and
+the rollback decision outside the code deployment; the code path is only the
+fail-closed read and hand-off contract.
+
+#### Japan MOD discovery surface and recovery gate
+
+The official discovery URL is the Japanese Joint Staff homepage,
+`https://www.mod.go.jp/js/`. The runtime makes one direct request and, after a
+transport failure, one request through `JAPAN_MOD_PROXY_URL` (falling back to
+`PROXY_URL`). It never downloads linked PDFs during a scheduled run.
+
+**Japan MOD's Cloudflare rule is path-level, not egress-level.** Measured
+2026-08-01, from both direct egress and the configured Decodo path:
+
+| Path | Result |
+|---|---|
+| `https://www.mod.go.jp/js/` | 200, 33,419 bytes, 9 `/js/pdf/2026/` links |
+| `https://www.mod.go.jp/js/pdf/2026/*.pdf` | 200, `application/pdf` |
+| `https://www.mod.go.jp/js/press/index-en.html` | 403 `Just a moment...` |
+| `https://www.mod.go.jp/js/index-en.html` | 403 |
+| `https://www.mod.go.jp/js/index.html` | 403 |
+| `https://www.mod.go.jp/js/press/` | 403 |
+| `https://www.mod.go.jp/js/en/` | 403 |
+
+Note that `/js/` succeeds while `/js/index.html` does not. Cloudflare fronts the
+succeeding path too — the 200 response carries a `window.__CF$cv$params` beacon —
+so this is a rule that exempts `/js/`, not a zone the CDN does not cover.
+Changing the discovery URL to any other path on this host is a regression, not a
+refinement. This is the general lesson for other Japanese government sources:
+probe the bare directory before concluding the host is blocked.
+
+**Do not derive an English companion PDF by inserting `e` before `.pdf`.** The
+English series carries its own counter, so the mapping resolves to unrelated
+releases. Measured 2026-08-01:
+
+| Document | Content |
+|---|---|
+| `p20260730_01.pdf` (JA) | 中国海軍艦艇の動向について — Chinese Navy, Renhai/Jiangkai II |
+| `p20260730_01e.pdf` | "Russian aircraft activity around Japan" (July 27) |
+| `p20260730_03e.pdf` | "Chinese Military Activities" — the real counterpart |
+
+That day Japanese published `_01`/`_02` while English published `_01e`–`_05e`.
+Every check that mapping would be validated against — HTTP 200,
+`application/pdf`, `%PDF` magic, Joint Staff publisher marker — passes on the
+*wrong* document, so it cannot be validated into correctness. The correct
+counterpart is only resolvable from the English index, which is the surface
+Cloudflare blocks. `parseJapanModIndex` therefore accepts only
+`/js/pdf/<year>/p<YYYYMMDD>_<NN>.pdf`, which structurally excludes the English
+series, and the source reports
+`companionResolution: english_index_blocked_no_derivable_companion`.
+
+Discovery records candidates for manual review; it never admits an observation.
+`admittedDocumentCount` counts hand-reviewed rows and `unreviewedCandidateCount`
+counts the discovered backlog. A 200 carrying no allowlisted release is
+`JMOD_INDEX_EMPTY`, not success.
+
+The blocked English index stays wired as `shadowIndexUrl`: a direct probe that
+runs at most once per 24 hours, only after the homepage request already
+succeeded. It is diagnostic only — it never contributes to `requestCount`,
+`errorCodes`, `transportStatus`, or `lastSuccessAt`. Watch
+`shadowIndexProbe.status` flip from `blocked` to `reachable`; that is the signal
+that English provenance can be restored and the `+e` constraint above revisited.
+`candidates` and `shadowIndexProbe` are operator-only and stripped from the
+anonymous bootstrap projection.
+
+If a future provider change is needed instead, the concrete external dependency
+for the current provider is an active
+[Decodo Site Unblocker](https://help.decodo.com/docs/site-unblocker-quick-start)
+subscription with source-specific credentials and a successful target test. The
+ordinary residential gateway credential is not a substitute for that product. If
+the provider requires disabling TLS verification, do not weaken the adapter;
+provision a trusted provider CA or use an approved authenticated HTTPS
+integration instead.
+
+Recovery is accepted only when:
+
+1. `crossStraitActivityJapanMod` reports `OK` for two consecutive scheduled
+   three-hour runs from distinct scheduled executions;
+2. `lastSuccessAt` is non-null, later than the deploy, and advances between
+   those two successful runs;
+3. the published `_seed.sourceVersion` reads
+   `taiwan-mnd-html+japan-joint-staff-homepage-v2`, proving the new adapter is
+   the code that ran rather than a merged-but-not-deployed PR;
+4. the source reports `transportMode: japanese_homepage_candidate_discovery`
+   and at least one newly discovered candidate tied to each successful fetch —
+   retained rows do not count;
+5. the combined cross-Strait publication remains available and explicitly
+   source-degraded when a later Japan MOD request fails.
 
 ### Bundle 6: seed-bundle-climate
 

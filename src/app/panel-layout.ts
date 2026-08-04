@@ -38,15 +38,23 @@ import {
 import { BETA_MODE } from '@/config/beta';
 import { t } from '@/services/i18n';
 import { getCurrentTheme } from '@/utils';
-import { trackCriticalBannerAction, trackCheckoutSuccess, trackCheckoutFailed, trackGateHit, replayPendingCheckoutSuccess, replayPendingProFunnelEvents } from '@/services/analytics';
+import { trackCriticalBannerAction, trackCheckoutSuccess, trackCheckoutFailed, trackGateHit, replayPendingCheckoutSuccess, replayPendingProFunnelEvents, replayPendingConversionEvents } from '@/services/analytics';
 import { getStoredMapModePreference } from '@/services/map-mode-preference';
-import { loadWidgets, saveWidget, isProUser } from '@/services/widget-store';
+import { loadWidgets, saveWidget, isProUser, isProTierResolved } from '@/services/widget-store';
+import { sanitizeLockedLayers, shouldSanitizeLockedLayers } from '@/config/map-layer-definitions';
 import type { CustomWidgetSpec } from '@/services/widget-store';
+import {
+  panelGateStateChanged,
+  sweepLegacyDisabledCustomWidgets,
+} from '@/app/free-tier-gate';
 import { initEntitlementSubscription, destroyEntitlementSubscription, isEntitlementActive, hasTier, getEntitlementState, onEntitlementChange } from '@/services/entitlements';
 import { createEntitlementReloadController } from '@/services/entitlement-reload-controller';
 import { initSubscriptionWatch, destroySubscriptionWatch, onSubscriptionChange } from '@/services/billing';
 import { initPaymentFailureBanner } from '@/components/payment-failure-banner';
-import { handleCheckoutReturn } from '@/services/checkout-return';
+import {
+  handleCheckoutReturn,
+  resolveCheckoutReturnRouting,
+} from '@/services/checkout-return';
 import { registerCheckoutSuccessCallback, destroyCheckoutOverlay, showCheckoutSuccess, consumePostCheckoutFlag, clearCheckoutAttempt, loadCheckoutAttempt } from '@/services/checkout';
 import {
   markProActivationPending,
@@ -76,6 +84,10 @@ import type { SupplyChainPanel } from '@/components/SupplyChainPanel';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
 import { loadPanelCollapsed, loadPanelColSpans, loadPanelSpans } from '@/utils/panel-storage';
 import { measure, mutate } from '@/utils/layout-batch';
+import {
+  hydrateGeoHubPanelFromClusters,
+  hydrateTechHubPanelFromClusters,
+} from '@/app/hub-activity-hydration';
 
 function readSessionStorageValue(key: string): string | null {
   try {
@@ -162,6 +174,7 @@ const WEB_CLERK_PRO_ONLY_PANELS = new Set([
  * ever moves below the pass without being listed here.
  */
 const LATE_REGISTERED_PANEL_KEYS = new Set(['live-news']);
+const CW_PRO_GATE_TAB_RECOVERY_KEY = 'worldmonitor-cw-pro-gate-tab-recovery-v1';
 
 const DASHBOARD_REFERENCE_LINKS = [
   { label: 'Countries', path: '/countries/' },
@@ -334,9 +347,11 @@ export interface PanelLayoutManagerCallbacks {
   openCountryBrief: (code: string) => void;
   openSearch: () => void;
   loadAllData: (forceAll?: boolean) => Promise<void>;
+  primeVisiblePanelData: () => void;
   updateMonitorResults: () => void;
   loadSecurityAdvisories?: () => Promise<void>;
   applyMapLayerChange?: (layer: keyof MapLayers, enabled: boolean, source: 'programmatic') => void;
+  isFreeTierFallbackActive?: () => boolean;
 }
 
 interface DeferredPanelMount {
@@ -402,16 +417,21 @@ export class PanelLayoutManager implements AppModule {
     // entitlement updates after purchasing (P1: newly upgraded users must
     // see their premium access without a manual page reload).
     //
-    // Two return paths need to seed the transition detector as post-checkout:
+    // Two account-bound return paths need to seed the transition detector as
+    // post-checkout:
     //   1. Full-page Dodo redirect — handleCheckoutReturn() reads
     //      subscription_id/status URL params and cleans them.
     //   2. Dodo overlay success — setTimeout(reload) with no URL params;
     //      we stash a session flag before the reload and consume it here.
     const returnResult = handleCheckoutReturn();
-    const returnedFromOverlay = consumePostCheckoutFlag();
-    const returnedFromCheckout = returnResult.kind === 'success' || returnedFromOverlay;
+    const returnedFromOverlayFlag = consumePostCheckoutFlag();
+    const {
+      returnedFromDesktopBrowser,
+      returnedFromCheckout,
+      returnedFromAccountCheckout,
+    } = resolveCheckoutReturnRouting(returnResult, returnedFromOverlayFlag);
     this.proActivationController = new ProActivationController(ctx, {
-      reloadPending: returnedFromCheckout,
+      reloadPending: returnedFromAccountCheckout,
       openAiAnalyst: () => this.revealAnalystPanel(),
       openSearch: callbacks.openSearch,
     });
@@ -419,19 +439,21 @@ export class PanelLayoutManager implements AppModule {
       // Funnel (#4931): the purchase-complete signal on the client side.
       // Queued by the analytics facade until Umami loads after first paint.
       trackCheckoutSuccess(returnResult.kind === 'success' ? 'url-return' : 'overlay-flag');
-      // Pro Activation Onboarding: capture the plan identity from the attempt
-      // record and write the durable pending-onboarding marker BEFORE the
-      // clear below wipes the attempt. Success branch only (the `failed`
-      // branch structurally cannot reach here). An overlay-only return may
-      // carry no attempt record → the marker omits productId and the boot
-      // hook falls back to the live entitlement snapshot for plan identity
-      // (never a write-time frozen fallback — see decideActivationMount).
-      const activationProductId = loadCheckoutAttempt()?.productId ?? null;
-      markProActivationPending(activationProductId);
-      // Full-page return cleared its URL params; belt-and-braces clear
-      // of the attempt record here catches the success path where the
-      // overlay handler never ran (direct Dodo redirect).
-      clearCheckoutAttempt('success');
+      if (returnedFromAccountCheckout) {
+        // Pro Activation Onboarding: capture the plan identity from the attempt
+        // record and write the durable pending-onboarding marker BEFORE the
+        // clear below wipes the attempt. Success branch only (the `failed`
+        // branch structurally cannot reach here). An overlay-only return may
+        // carry no attempt record → the marker omits productId and the boot
+        // hook falls back to the live entitlement snapshot for plan identity
+        // (never a write-time frozen fallback — see decideActivationMount).
+        const activationProductId = loadCheckoutAttempt()?.productId ?? null;
+        markProActivationPending(activationProductId);
+        // Full-page return cleared its URL params; belt-and-braces clear
+        // of the attempt record here catches the success path where the
+        // overlay handler never ran (direct Dodo redirect).
+        clearCheckoutAttempt('success');
+      }
       // waitForEntitlement: true keeps the banner mounted across the
       // entitlement-watcher reload (post-PR-4 the watcher is the single
       // reload source). If the user is already entitled on mount the
@@ -441,8 +463,13 @@ export class PanelLayoutManager implements AppModule {
       // app) and masked in the banner before rendering to keep the raw
       // address out of screenshots / screen-shares of the banner.
       showCheckoutSuccess({
-        waitForEntitlement: true,
-        email: getAuthState().user?.email ?? null,
+        // The desktop marker acknowledges payment in an arbitrary browser;
+        // it cannot prove that browser is signed into the purchasing Clerk
+        // account. Keep that path informational instead of waiting on (or
+        // displaying) another browser identity's entitlement.
+        waitForEntitlement: !returnedFromDesktopBrowser,
+        accountAgnostic: returnedFromDesktopBrowser,
+        email: returnedFromDesktopBrowser ? null : getAuthState().user?.email ?? null,
       });
     } else if (returnResult.kind === 'failed') {
       trackCheckoutFailed(returnResult.rawStatus);
@@ -461,6 +488,11 @@ export class PanelLayoutManager implements AppModule {
     // in the same tab — on BOTH the checkout-return and ordinary branches —
     // so this replay is unconditional (no-op when nothing is pending).
     replayPendingProFunnelEvents();
+
+    // Dashboard checkout-start / checkout-failed have the same exposure: both
+    // are followed by a navigation (the Dodo redirect) that outlives any
+    // in-page retry, so their durable markers replay here too.
+    replayPendingConversionEvents();
 
     // Always register the payment-failure-banner listener — onSubscriptionChange
     // is an in-memory listener registry, doesn't open any network connection,
@@ -537,7 +569,7 @@ export class PanelLayoutManager implements AppModule {
     // tests/entitlement-reload-controller.test.mts locks the cross-boot
     // one-navigation invariant from the daypesta customer recording.
     const entitlementReloadController = createEntitlementReloadController({
-      returnedFromCheckout,
+      returnedFromCheckout: returnedFromAccountCheckout,
       onSnapshot: () => this.updatePanelGating(getAuthState()),
       reload: () => {
         console.log('[entitlements] Subscription activated — reloading once to unlock panels');
@@ -545,8 +577,25 @@ export class PanelLayoutManager implements AppModule {
       },
     });
     this.unsubscribeEntitlementChange = onEntitlementChange((state) => {
+      // Desktop checkout is handed to the OS browser, so the app itself never
+      // receives the Dodo return URL. Once its Clerk-bound entitlement becomes
+      // active, retire the app-local retry/referral state here instead. This
+      // is scoped to the desktop app; an anonymous or mismatched browser must
+      // never clear its own unrelated local checkout state.
+      // Preserve null for unavailable auth-handoff snapshots: isEntitlementActive
+      // collapses null→false, which would invent a free→pro edge and re-trigger
+      // the daypesta reload loop (see createEntitlementReloadController).
+      const entitlementActive =
+        state === null ? null : isEntitlementActive(state, Date.now());
+      if (
+        this.ctx.isDesktopApp &&
+        entitlementActive === true &&
+        loadCheckoutAttempt()
+      ) {
+        clearCheckoutAttempt('success');
+      }
       entitlementReloadController.handleSnapshot(
-        state === null ? null : isEntitlementActive(state, Date.now()),
+        entitlementActive,
         getAuthState().user?.id ?? null,
       );
     });
@@ -794,13 +843,13 @@ export class PanelLayoutManager implements AppModule {
     this.updateTabCapLock();
   }
 
-  /** #5159/#5205 review: storage access can throw (blocked cookies, sandboxed
+  /** #5159/#5205/#5201: storage access can throw (blocked cookies, sandboxed
    *  iframe) and this runs BEFORE the shell installs — an uncaught throw would
    *  strand users on the boot skeleton. loadFromStorage is try/catch-guarded;
-   *  default is expanded. Wire format stays 'true'/'false' (JSON booleans),
-   *  identical to the previous String(isCollapsed) writes. */
+   *  first-time mobile visitors default to the collapsed, feed-first Today
+   *  state. Wire format stays 'true'/'false' (JSON booleans). */
   private static isMobileMapCollapsedPreferred(): boolean {
-    return loadFromStorage<boolean>('mobile-map-collapsed', false) === true;
+    return loadFromStorage<boolean>('mobile-map-collapsed', true) === true;
   }
 
   async renderLayout(): Promise<void> {
@@ -828,9 +877,6 @@ export class PanelLayoutManager implements AppModule {
       <div id="proBannerSlot" class="pro-banner-slot" aria-live="polite"></div>
       <div class="header">
         <div class="header-left">
-          <button class="hamburger-btn" id="hamburgerBtn" aria-label="Menu">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-          </button>
           <div class="variant-switcher">${(() => {
         const local = this.ctx.isDesktopApp || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
         const inIframe = window.self !== window.top;
@@ -846,7 +892,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-label">${t('header.world')}</span>
             </a>
             <span class="variant-divider"></span>
-            <a href="${vHref('tech', 'https://tech.worldmonitor.app')}"
+            <a href="${vHref('tech', 'https://tech.worldmonitor.app/dashboard')}"
                class="variant-option ${SITE_VARIANT === 'tech' ? 'active' : ''}"
                data-variant="tech"
                ${vTarget('tech')}
@@ -855,7 +901,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-label">${t('header.tech')}</span>
             </a>
             <span class="variant-divider"></span>
-            <a href="${vHref('finance', 'https://finance.worldmonitor.app')}"
+            <a href="${vHref('finance', 'https://finance.worldmonitor.app/dashboard')}"
                class="variant-option ${SITE_VARIANT === 'finance' ? 'active' : ''}"
                data-variant="finance"
                ${vTarget('finance')}
@@ -864,7 +910,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-label">${t('header.finance')}</span>
             </a>
             <span class="variant-divider"></span>
-            <a href="${vHref('commodity', 'https://commodity.worldmonitor.app')}"
+            <a href="${vHref('commodity', 'https://commodity.worldmonitor.app/dashboard')}"
                class="variant-option ${SITE_VARIANT === 'commodity' ? 'active' : ''}"
                data-variant="commodity"
                ${vTarget('commodity')}
@@ -873,7 +919,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-label">${t('header.commodity')}</span>
             </a>
             <span class="variant-divider"></span>
-            <a href="${vHref('energy', 'https://energy.worldmonitor.app')}"
+            <a href="${vHref('energy', 'https://energy.worldmonitor.app/dashboard')}"
                class="variant-option ${SITE_VARIANT === 'energy' ? 'active' : ''}"
                data-variant="energy"
                ${vTarget('energy')}
@@ -882,7 +928,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-label">${t('header.energy')}</span>
             </a>
             <span class="variant-divider"></span>
-            <a href="${vHref('happy', 'https://happy.worldmonitor.app')}"
+            <a href="${vHref('happy', 'https://happy.worldmonitor.app/dashboard')}"
                class="variant-option ${SITE_VARIANT === 'happy' ? 'active' : ''}"
                data-variant="happy"
                ${vTarget('happy')}
@@ -940,6 +986,12 @@ export class PanelLayoutManager implements AppModule {
           <button class="mobile-menu-close" id="mobileMenuClose" aria-label="Close menu">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
+        </div>
+        <div class="mobile-menu-divider"></div>
+        <div class="mobile-menu-account" aria-label="Account">
+          <span class="mobile-menu-account-icon" aria-hidden="true">◯</span>
+          <div id="mobileAuthWidgetMount"></div>
+          <button class="mobile-auth-fallback" id="mobileAuthFallback" type="button">Sign In</button>
         </div>
         <div class="mobile-menu-divider"></div>
         ${(() => {
@@ -1043,8 +1095,24 @@ export class PanelLayoutManager implements AppModule {
         </div>
         <div class="map-width-resize-handle" id="mapWidthResizeHandle"></div>
         <div class="panels-grid" id="panelsGrid" role="tabpanel"></div>
-        <button class="search-mobile-fab" id="searchMobileFab" aria-label="Search">\u{1F50D}</button>
       </main>
+      <nav class="mobile-tab-bar" id="mobileTabBar" aria-label="Primary">
+        <button class="mobile-tab active" type="button" data-mobile-tab="today" aria-current="page">
+          <span class="mobile-tab-icon" aria-hidden="true">◉</span><span>Today</span>
+        </button>
+        <button class="mobile-tab" type="button" data-mobile-tab="map">
+          <span class="mobile-tab-icon" aria-hidden="true">◎</span><span>Map</span>
+        </button>
+        <button class="mobile-tab" type="button" data-mobile-tab="search">
+          <span class="mobile-tab-icon" aria-hidden="true">⌕</span><span>Search</span>
+        </button>
+        <button class="mobile-tab" type="button" data-mobile-tab="alerts">
+          <span class="mobile-tab-icon" aria-hidden="true">△</span><span>Alerts</span>
+        </button>
+        <button class="mobile-tab" type="button" data-mobile-tab="more">
+          <span class="mobile-tab-icon" aria-hidden="true">•••</span><span>More</span>
+        </button>
+      </nav>
       <footer class="site-footer">
         <div class="site-footer-brand">
           <img src="/favico/android-chrome-96x96.png" alt="" width="28" height="28" loading="lazy" decoding="async" class="site-footer-icon" />
@@ -1116,23 +1184,14 @@ export class PanelLayoutManager implements AppModule {
       };
       state = { activeTabId: initial.id, tabs: [initial] };
       saveTabsState(state);
-    } else {
-      // Clamp stored snapshots to the current free-tier cap so a workspace
-      // saved while Pro (or persisted before the cap existed) can't re-enable
-      // an over-cap layout when the user later switches to it. applyTabPanelState
-      // re-clamps on apply too; this keeps the persisted store self-healing.
-      const pro = isProUser();
-      let healedSnapshots = false;
-      for (const tab of state.tabs) {
-        const clamped = enforceFreePanelLimit(tab.panelSettings, pro);
-        if (this.panelSettingsEnabledStateChanged(tab.panelSettings, clamped)) {
-          healedSnapshots = true;
-        }
-        tab.panelSettings = clamped;
-      }
-      if (healedSnapshots) saveTabsState(state);
     }
     this.tabsState = state;
+    // Clamp stored snapshots to the current free-tier cap so a workspace saved
+    // while Pro (or persisted before the cap existed) can't re-enable an
+    // over-cap layout when the user later switches to it. Skips itself while
+    // the tier is unresolved; the App-owned fallback counts as a settled free
+    // answer and also re-runs this method for tabs not yet opened.
+    this.healStoredTabSnapshots();
 
     this.panelTabBar = new PanelTabBar(() => this.tabsState!, {
       onSelect: (id) => this.switchToTab(id),
@@ -1144,15 +1203,68 @@ export class PanelLayoutManager implements AppModule {
     this.updateTabCapLock();
   }
 
+  /**
+   * Reconcile every stored tab snapshot against the current entitlement.
+   *
+   * Persisting a free-tier clamp while the tier is still unknown is the same
+   * bug App.enforceFreeTierLimits defers around: a Pro user's custom widgets
+   * would be written out of their saved workspaces on every load. Bail out
+   * until the answer is real or the bounded free fallback fires; App calls
+   * this again from the auth and entitlement callbacks, and
+   * applyTabPanelState re-clamps on switch.
+   */
+  public healStoredTabSnapshots(): void {
+    const state = this.tabsState;
+    if (!state || !this.isProTierResolvedOrFallback()) return;
+
+    const pro = isProUser();
+    let healedSnapshots = pro ? this.restoreLegacyCustomWidgetTabs(state) : false;
+    for (const tab of state.tabs) {
+      const clamped = enforceFreePanelLimit(tab.panelSettings, pro);
+      if (this.panelSettingsEnabledStateChanged(tab.panelSettings, clamped)) {
+        healedSnapshots = true;
+      }
+      tab.panelSettings = clamped;
+    }
+    if (healedSnapshots) saveTabsState(state);
+  }
+
+  private isProTierResolvedOrFallback(): boolean {
+    return isProTierResolved() || this.callbacks.isFreeTierFallbackActive?.() === true;
+  }
+
+  /**
+   * Repair pre-`proGated` widget damage in saved tabs once per browser.
+   *
+   * App's global recovery can run before panel tabs initialize, so tabs own a
+   * separate marker. The same ambiguity applies here: markerless disabled
+   * widgets may be deliberate hides, which is why this sweep is bounded to one
+   * migration pass rather than being re-run on every entitlement refresh.
+   */
+  private restoreLegacyCustomWidgetTabs(state: TabsState): boolean {
+    try {
+      if (localStorage.getItem(CW_PRO_GATE_TAB_RECOVERY_KEY)) return false;
+
+      const ownedWidgetIds = new Set(loadWidgets().map((widget) => widget.id));
+      let changed = false;
+      for (const tab of state.tabs) {
+        const restored = sweepLegacyDisabledCustomWidgets(tab.panelSettings, ownedWidgetIds);
+        if (panelGateStateChanged(tab.panelSettings, restored)) changed = true;
+        tab.panelSettings = restored;
+      }
+      localStorage.setItem(CW_PRO_GATE_TAB_RECOVERY_KEY, 'done');
+      return changed;
+    } catch {
+      // Persistence-only migration; blocked storage leaves the tab usable.
+      return false;
+    }
+  }
+
   private panelSettingsEnabledStateChanged(
     before: Record<string, PanelConfig>,
     after: Record<string, PanelConfig>,
   ): boolean {
-    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
-    for (const key of keys) {
-      if (before[key]?.enabled !== after[key]?.enabled) return true;
-    }
-    return false;
+    return panelGateStateChanged(before, after);
   }
 
   /** Capture the live panel state (settings + order) for a tab snapshot. */
@@ -1239,7 +1351,13 @@ export class PanelLayoutManager implements AppModule {
     const tab: PanelTab = {
       id: generateTabId(),
       name: t('dashboardTabs.newTabName'),
-      panelSettings: enforceFreePanelLimit(defaults.panelSettings, isProUser()),
+      // Same unresolved-tier caveat as applyTabPanelState: clamping a new tab
+      // before the entitlement is known bakes a free-tier layout into a Pro
+      // user's workspace, and the count clamp carries no marker to undo. Once
+      // the bounded fallback fires, the tier is settled enough to clamp.
+      panelSettings: this.isProTierResolvedOrFallback()
+        ? enforceFreePanelLimit(defaults.panelSettings, isProUser())
+        : defaults.panelSettings,
       panelOrder: defaults.panelOrder,
       bottomSet: [],
     };
@@ -1321,7 +1439,16 @@ export class PanelLayoutManager implements AppModule {
     // panel selection into STORAGE_KEYS.panels, so clamping here means no tab
     // operation (add / switch / delete-fallback) can ever persist an over-cap
     // workspace, regardless of how the snapshot was produced.
-    const capped = enforceFreePanelLimit(next, isProUser());
+    //
+    // Unless the tier isn't known yet and the bounded fallback has not fired —
+    // a tab click can land inside the same unresolved-session window the boot
+    // clamp defers around. Skipping the clamp leaves an over-cap workspace
+    // live for at most that window; App re-runs enforcement (and
+    // healStoredTabSnapshots) when the entitlement resolves or the fallback
+    // settles the account as free.
+    const capped = this.isProTierResolvedOrFallback()
+      ? enforceFreePanelLimit(next, isProUser())
+      : next;
 
     this.ctx.panelSettings = capped;
     saveToStorage(STORAGE_KEYS.panels, capped);
@@ -1853,6 +1980,11 @@ export class PanelLayoutManager implements AppModule {
     this.observePanelForHydration(panel);
     if (config?.enabled) {
       this.scheduleHydrationForPanelElement(panel.getElement(), 'near');
+      // Deferred App-owned panels (Stablecoins, ETF flows, Gulf economies,
+      // etc.) are absent when the scroll frame first scans state. Hand off
+      // again after mounting so their panel-specific loader can run without a
+      // second user scroll. App gates this callback until slow-tier readiness.
+      this.callbacks.primeVisiblePanelData();
     }
   }
 
@@ -2283,15 +2415,29 @@ export class PanelLayoutManager implements AppModule {
 
     this.lazyDefaultPanel('cross-source-signals', () => import('@/components/CrossSourceSignalsPanel'), 'CrossSourceSignalsPanel');
 
+    // Hub panels pull retained clusters at mount rather than going through
+    // callPanel()/replayPendingCalls(). That queue would have to be fed the
+    // computed activities on every clustering pass, and computing tech activities
+    // requires the tech-activity → tech-hub-index → ~62KB tech-geo chain — which
+    // applyTechHubActivities() deliberately loads only when the panel is already
+    // mounted (#4404). Pulling on mount keeps that chunk off the critical path.
     this.lazyImportedPanel('geo-hubs', () => import('@/components/GeoHubsPanel'), 'GeoHubsPanel', (GeoHubsPanel) => {
       const p = new GeoHubsPanel();
       p.setOnHubClick((hub) => { this.ctx.map?.setCenter(hub.lat, hub.lon, 4); });
+      hydrateGeoHubPanelFromClusters(p, this.ctx.latestClusters, {
+        allowEmpty: this.ctx.clustersSettled,
+      });
       return p;
     });
 
     this.lazyImportedPanel('tech-hubs', () => import('@/components/TechHubsPanel'), 'TechHubsPanel', (TechHubsPanel) => {
       const p = new TechHubsPanel();
       p.setOnHubClick((hub) => { this.ctx.map?.setCenter(hub.lat, hub.lon, 4); });
+      void hydrateTechHubPanelFromClusters(p, this.ctx.latestClusters, {
+        allowEmpty: this.ctx.clustersSettled,
+      }).catch((err) => {
+        console.error('[panel] failed to lazy-load "tech-hubs" activity data', err);
+      });
       return p;
     });
 
@@ -2623,7 +2769,9 @@ export class PanelLayoutManager implements AppModule {
       view: this.ctx.isMobile ? this.ctx.resolvedLocation : 'global',
       layers: this.ctx.mapLayers,
       timeRange: '7d',
-    }, preferGlobe);
+    }, preferGlobe, {
+      isFreeTierFallbackActive: this.callbacks.isFreeTierFallbackActive,
+    });
 
     const eagerSupplyChainPanel = this.ctx.panels['supply-chain'] as SupplyChainPanel | undefined;
     if (eagerSupplyChainPanel) {
@@ -2773,6 +2921,19 @@ export class PanelLayoutManager implements AppModule {
       if (normalized.resilienceScore && !this.ctx.map.isDeckGLActive?.()) {
         normalized = { ...normalized, resilienceScore: false };
       }
+      // MapContainer also sanitizes at the renderer boundary, but update the
+      // context and persisted URL preference with the effective state first.
+      // Otherwise a settled-free user can have the locked layer stripped from
+      // the renderer while ctx.mapLayers/localStorage retain the stale `true`
+      // value and a later preference/URL reapplication resurrects it (#6045).
+      if (shouldSanitizeLockedLayers(
+        hasPremiumAccess(getAuthState()),
+        isProTierResolved(),
+        this.callbacks.isFreeTierFallbackActive?.() === true,
+      )) {
+        normalized = sanitizeLockedLayers(normalized, false);
+      }
+      this.ctx.initialUrlState.layers = normalized;
       this.ctx.mapLayers = normalized;
       saveToStorage(STORAGE_KEYS.mapLayers, normalized);
       this.ctx.map.setLayers(normalized);

@@ -9,7 +9,7 @@ import { getSourceProvenanceState } from '../../../shared/source-provenance';
 import { CII_RISK_SCORE_CACHE_KEYS } from '../../_cii-risk-cache-keys.js';
 // @ts-expect-error — generated Edge-safe JS mirror; authored types live in shared/bootstrap-tier-keys.d.ts
 import { BOOTSTRAP_CACHE_KEYS } from '../../_bootstrap-tier-keys.js';
-import { DEFAULT_LIST_LIMIT } from '../constants';
+import { DEFAULT_LIST_LIMIT, MARKET_FRESHNESS_CHECKS } from '../constants';
 import {
   argBool,
   argNum,
@@ -219,11 +219,40 @@ function projectChinaMacroForMcp(value: unknown): unknown {
   };
 }
 
+const MARKET_SECTOR_MAX_STALE_MIN = MARKET_FRESHNESS_CHECKS[1].maxStaleMin;
+
+// `get_market_data` bundles several independently seeded caches. The outer
+// envelope carries aggregate freshness, but sector valuation coverage also
+// needs a field-level freshness bit so a caller filtering to sectors does not
+// mistake an old valuation snapshot for a current one.
+export function applySectorValuationFreshness(
+  data: Record<string, unknown>,
+  now = Date.now(),
+): Record<string, unknown> {
+  const sectors = data.sectors;
+  if (!sectors || typeof sectors !== 'object' || Array.isArray(sectors)) return data;
+  const coverage = (sectors as Record<string, unknown>).valuationCoverage;
+  if (!coverage || typeof coverage !== 'object' || Array.isArray(coverage)) {
+    (sectors as Record<string, unknown>).valuationCoverage = {
+      sourceStatus: 'degraded',
+      stale: true,
+    };
+    return data;
+  }
+  const fetchedAtValue = (coverage as Record<string, unknown>).fetchedAt;
+  const fetchedAt = typeof fetchedAtValue === 'number' || typeof fetchedAtValue === 'string'
+    ? Number(fetchedAtValue)
+    : Number.NaN;
+  (coverage as Record<string, unknown>).stale = !Number.isFinite(fetchedAt)
+    || (now - fetchedAt) / 60_000 > MARKET_SECTOR_MAX_STALE_MIN;
+  return data;
+}
+
 export const CACHE_TOOLS: ToolDef[] = [
   {
     name: 'get_market_data',
     _outputBudgetBytes: 131072,
-    description: 'Real-time equity quotes, commodity prices (including gold futures GC=F), crypto prices, forex FX rates (USD/EUR, USD/JPY etc.), sector performance, ETF flows, and Gulf market quotes from WorldMonitor\'s curated bootstrap cache.',
+    description: 'Real-time equity quotes, commodity prices (including gold futures GC=F), crypto prices, forex FX rates (USD/EUR, USD/JPY etc.), sector performance and valuation coverage, ETF flows, and Gulf market quotes from WorldMonitor\'s curated bootstrap cache.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -268,6 +297,51 @@ export const CACHE_TOOLS: ToolDef[] = [
         properties: {
           sectors: { type: 'array', items: { type: 'object', properties: { symbol: { type: 'string' }, name: { type: 'string' }, changePercent: { type: 'number' } } } },
           valuations: { type: ['object', 'array', 'null'] },
+          valuationCoverage: {
+            type: ['object', 'null'],
+            properties: {
+              valuationCount: { type: 'number' },
+              expectedValuationCount: { type: 'number' },
+              sourceStatus: { type: 'string', enum: ['ok', 'partial', 'degraded'] },
+              source: { type: 'string' },
+              fetchedAt: { type: 'number' },
+              stale: { type: 'boolean' },
+              unavailableSymbols: { type: 'array', items: { type: 'string' } },
+              valuationDiagnostics: {
+                type: 'array',
+                description: 'Bounded per-symbol direct/proxy outcomes from the final Yahoo valuation routes. This is diagnostic metadata, not a valuation record.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    symbol: { type: 'string' },
+                    outcomes: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          route: { type: 'string', enum: ['v7Quote', 'quoteSummary'] },
+                          transport: { type: 'string', enum: ['direct', 'proxy'] },
+                          attempts: { type: 'number' },
+                          status: { type: 'number' },
+                          responseClass: { type: 'string' },
+                          missingFields: { type: 'array', items: { type: 'string' } },
+                          failure: { type: 'string' },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+              lastGood: {
+                type: ['object', 'null'],
+                properties: {
+                  fetchedAt: { type: 'number' },
+                  stale: { type: 'boolean' },
+                  symbols: { type: 'array', items: { type: 'string' } },
+                },
+              },
+            },
+          },
         },
       },
       'etf-flows': {
@@ -308,6 +382,87 @@ export const CACHE_TOOLS: ToolDef[] = [
           narrowNested(data, label, 'quotes', (q) => matchesCode(q.symbol, symbols));
         }
         narrowNested(data, 'sectors', 'sectors', (s) => matchesCode(s.symbol, symbols));
+        const sectorData = data.sectors;
+        if (sectorData && typeof sectorData === 'object' && !Array.isArray(sectorData)) {
+          const sector = sectorData as Record<string, unknown>;
+          const coverage = sector.valuationCoverage;
+          const valuations = sector.valuations;
+          const unavailable = coverage && typeof coverage === 'object' && !Array.isArray(coverage)
+            ? (coverage as Record<string, unknown>).unavailableSymbols
+            : null;
+          const allSectorSymbols = new Set<string>([
+            ...(Array.isArray(sector.sectors)
+              ? sector.sectors.flatMap((row) => {
+                if (!row || typeof row !== 'object' || Array.isArray(row)) return [];
+                const symbol = (row as Record<string, unknown>).symbol;
+                return typeof symbol === 'string' ? [symbol.toLowerCase()] : [];
+              })
+              : []),
+            ...(valuations && typeof valuations === 'object' && !Array.isArray(valuations)
+              ? Object.keys(valuations).map((symbol) => symbol.toLowerCase())
+              : []),
+            ...(Array.isArray(unavailable)
+              ? unavailable.filter((symbol): symbol is string => typeof symbol === 'string').map((symbol) => symbol.toLowerCase())
+              : []),
+          ]);
+          const requestedSectorSymbols = symbols.filter((symbol) => allSectorSymbols.has(symbol));
+          // symbols= is active: always project sector valuations/coverage to the
+          // requested sector subset (empty when the filter is equity-only).
+          if (valuations && typeof valuations === 'object' && !Array.isArray(valuations)) {
+            sector.valuations = Object.fromEntries(
+              Object.entries(valuations).filter(([symbol]) => requestedSectorSymbols.includes(symbol.toLowerCase())),
+            );
+          }
+          if (coverage && typeof coverage === 'object' && !Array.isArray(coverage)) {
+            const coverageRecord = coverage as Record<string, unknown>;
+            if (Array.isArray(coverageRecord.unavailableSymbols)) {
+              const filteredUnavailable = coverageRecord.unavailableSymbols
+                .filter((symbol): symbol is string => typeof symbol === 'string')
+                .filter((symbol) => requestedSectorSymbols.includes(symbol.toLowerCase()));
+              if (filteredUnavailable.length === 0) {
+                delete coverageRecord.unavailableSymbols;
+              } else {
+                coverageRecord.unavailableSymbols = filteredUnavailable;
+              }
+            }
+            if (coverageRecord.lastGood && typeof coverageRecord.lastGood === 'object' && !Array.isArray(coverageRecord.lastGood)) {
+              const lastGoodRecord = coverageRecord.lastGood as Record<string, unknown>;
+              if (Array.isArray(lastGoodRecord.symbols)) {
+                lastGoodRecord.symbols = lastGoodRecord.symbols
+                  .filter((symbol): symbol is string => typeof symbol === 'string')
+                  .filter((symbol) => requestedSectorSymbols.includes(symbol.toLowerCase()));
+              }
+              // Match seeder omit-empty: never leave lastGood with symbols:[].
+              if (!Array.isArray(lastGoodRecord.symbols) || lastGoodRecord.symbols.length === 0) {
+                delete coverageRecord.lastGood;
+              }
+            }
+            if (Array.isArray(coverageRecord.valuationDiagnostics)) {
+              const filteredDiagnostics = coverageRecord.valuationDiagnostics.filter((diagnostic) => {
+                if (!diagnostic || typeof diagnostic !== 'object' || Array.isArray(diagnostic)) return false;
+                const symbol = (diagnostic as Record<string, unknown>).symbol;
+                return typeof symbol === 'string' && requestedSectorSymbols.includes(symbol.toLowerCase());
+              });
+              if (filteredDiagnostics.length === 0) {
+                delete coverageRecord.valuationDiagnostics;
+              } else {
+                coverageRecord.valuationDiagnostics = filteredDiagnostics;
+              }
+            }
+            const filteredValuationCount = sector.valuations && typeof sector.valuations === 'object' && !Array.isArray(sector.valuations)
+              ? Object.keys(sector.valuations).length
+              : 0;
+            const expectedValuationCount = requestedSectorSymbols.length;
+            coverageRecord.valuationCount = filteredValuationCount;
+            coverageRecord.expectedValuationCount = expectedValuationCount;
+            // Empty request set (no sector symbols matched): complete empty view, not degraded.
+            coverageRecord.sourceStatus = expectedValuationCount === 0
+              ? 'ok'
+              : filteredValuationCount === 0
+                ? 'degraded'
+                : filteredValuationCount < expectedValuationCount ? 'partial' : 'ok';
+          }
+        }
         narrowNested(data, 'etf-flows', 'etfs', (e) => matchesCode(e.ticker, symbols));
       }
       const limit = argNum(params.limit) ?? DEFAULT_LIST_LIMIT;
@@ -316,6 +471,7 @@ export const CACHE_TOOLS: ToolDef[] = [
       }
       capNested(data, 'sectors', 'sectors', limit);
       capNested(data, 'etf-flows', 'etfs', limit);
+      applySectorValuationFreshness(data);
       const cls = argStrList(params.asset_class);
       if (cls.length > 0) {
         const map: Record<string, string> = {
@@ -340,6 +496,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     ],
     _seedMetaKey: 'seed-meta:market:stocks',
     _maxStaleMin: 30,
+    _freshnessChecks: [...MARKET_FRESHNESS_CHECKS],
     // NOTE: `GET /api/market/v1/get-gold-intelligence` is NOT covered here.
     // The audit-time cross-reference matched on the single `market:commodities-bootstrap:v1`
     // key shared between this tool and the gold-intel handler, but the handler also reads 4
@@ -1900,6 +2057,13 @@ export const CACHE_TOOLS: ToolDef[] = [
     // slow chokepoint-baselines budget, and the long-cadence portwatch keys
     // don't drag aggregate stale flagging.
     //
+    // That mirror claim is ENFORCED, not aspirational: the portwatch-ports
+    // entry is asserted field-for-field against health's exported
+    // SEED_META.portwatchPortActivity in
+    // tests/mcp-portwatch-content-freshness-parity.test.mjs. #4293 aligned the
+    // two surfaces on cardinality; #6080 aligned them on content freshness
+    // after the comment had silently stopped being true.
+    //
     // Payload measurement (PR pre-merge, fun-toad-55127.upstash.io 2026-05-11):
     //   transit-summaries:v1                        — 6.8 KB
     //   chokepoint_transits:v1                      — 1.1 KB
@@ -1931,7 +2095,16 @@ export const CACHE_TOOLS: ToolDef[] = [
     _freshnessChecks: [
       { key: 'seed-meta:supply_chain:transit-summaries',   maxStaleMin: 30 },             // 10-min relay; 30min = 3× interval
       { key: 'seed-meta:supply_chain:chokepoint_transits', maxStaleMin: 30 },             // 10-min relay; 30min = 3× interval
-      { key: 'seed-meta:supply_chain:portwatch-ports',     maxStaleMin: 2160, minRecordCount: 174 }, // 12h cron; 36h = 3× interval; #3613 requires full country coverage
+      // #3613 requires full country coverage; #6060 adds the per-entity content
+      // dimension — a complete 174/174 run can still carry a synthetic >170h-old CN payload,
+      // which transport age and record count both read as fresh (#6080).
+      {
+        key: 'seed-meta:supply_chain:portwatch-ports',
+        maxStaleMin: 2160, // 12h cron; 36h = 3× interval
+        minRecordCount: 174,
+        requireContentFreshness: { countries: ['CN', 'HK'], budgetMinutes: 2 * 72 * 60 },
+        contentFreshnessActivationKey: 'seed-activated:supply_chain:portwatch-ports:content-freshness',
+      },
       { key: 'seed-meta:energy:chokepoint-baselines',      maxStaleMin: 60 * 24 * 400 },  // ~400d static registry
       { key: 'seed-meta:portwatch:chokepoints-ref',        maxStaleMin: 60 * 24 * 14 },   // weekly cron; 14d = 2× interval
       { key: 'seed-meta:energy:chokepoint-flows',          maxStaleMin: 720 },            // 6h cron; 12h = 2× interval

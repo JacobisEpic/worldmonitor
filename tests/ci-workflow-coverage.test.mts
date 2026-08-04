@@ -20,6 +20,7 @@ const testWorkflow = read(resolve(workflowsDir, 'test.yml'));
 const desktopBuildWorkflow = read(resolve(workflowsDir, 'build-desktop.yml'));
 const desktopCanaryWorkflow = read(resolve(workflowsDir, 'test-linux-app.yml'));
 const lintCodeWorkflow = read(resolve(workflowsDir, 'lint-code.yml'));
+const protoCheckWorkflow = read(resolve(workflowsDir, 'proto-check.yml'));
 const workflowText = readdirSync(workflowsDir)
   .filter((name) => name.endsWith('.yml') || name.endsWith('.yaml'))
   .map((name) => read(resolve(workflowsDir, name)))
@@ -97,7 +98,8 @@ const REQUIRED_DESKTOP_CONFIG_INPUTS = [
   'package.json',
   'scripts/repack-linux-appimage.sh',
   'scripts/sync-desktop-version.mjs',
-  '.github/workflows/(build-desktop|test-linux-app|test).yml',
+  'scripts/check-desktop-build-env.mjs',
+  'scripts/check-rust-security-floors.mjs',
 ] as const;
 
 const REQUIRED_DESKTOP_RUST_INPUTS = [
@@ -142,6 +144,50 @@ function workflowStepBlock(workflow: string, stepName: string): string {
   assert.notEqual(startIndex, -1, `workflow must define step ${stepName}`);
   const nextStepIndex = workflow.indexOf('\n      - ', startIndex + marker.length);
   return workflow.slice(startIndex, nextStepIndex === -1 ? workflow.length : nextStepIndex);
+}
+
+function workflowStepBlocksByUses(workflow: string, action: string): string[] {
+  const marker = new RegExp(`\\n      - uses: ${escapeRegExp(action)}@[^\\n]+\\n`, 'g');
+  const blocks: string[] = [];
+  for (const match of workflow.matchAll(marker)) {
+    const startIndex = match.index ?? -1;
+    assert.notEqual(startIndex, -1, `workflow must define ${action}`);
+    const nextStepIndex = workflow.indexOf('\n      - ', startIndex + match[0].length);
+    blocks.push(workflow.slice(startIndex, nextStepIndex === -1 ? workflow.length : nextStepIndex));
+  }
+  assert.ok(blocks.length > 0, `workflow must define ${action}`);
+  return blocks;
+}
+
+function workflowRunScript(stepBlock: string): string {
+  const marker = '\n        run: |\n';
+  const startIndex = stepBlock.indexOf(marker);
+  assert.notEqual(startIndex, -1, 'workflow step must have a block run script');
+  return stepBlock
+    .slice(startIndex + marker.length)
+    .split('\n')
+    .map((line) => line.replace(/^ {10}/, ''))
+    .join('\n');
+}
+
+function runReleasePreflight(stepBlock: string, eventName: string, draft: string, value: string): void {
+  const script = workflowRunScript(stepBlock)
+    .replaceAll('${{ github.event_name }}', eventName)
+    .replaceAll('${{ github.event.inputs.draft }}', draft);
+  const names = [
+    'VITE_CLERK_PUBLISHABLE_KEY',
+    'VITE_WS_RELAY_URL',
+    'VITE_PMTILES_URL_PUBLIC',
+    'CONVEX_URL',
+  ];
+  const env = Object.fromEntries(names.map((name) => [name, value]));
+  execFileSync('bash', ['-e', '-o', 'pipefail', '-c', script], { env, encoding: 'utf8' });
+}
+
+function evaluateDesktopConfigFilter(filter: string, files: string[]): string {
+  const fileArgs = files.map((file) => JSON.stringify(file)).join(' ');
+  const script = `FILES=$(printf '%s\\n' ${fileArgs}); ${filter}; printf '%s' "$DESKTOP_CONFIG"`;
+  return execFileSync('bash', ['-euo', 'pipefail', '-c', script], { encoding: 'utf8' }).trim();
 }
 
 function workflowJobNames(workflow: string, label: string): string[] {
@@ -248,6 +294,49 @@ function securityAuditMatrixLockfiles(): string[] {
 }
 
 describe('CI workflow coverage', () => {
+  it('runs the proto breaking check against the full main history (#6114)', () => {
+    const breakingJob = workflowJobBlock(protoCheckWorkflow, 'proto-breaking');
+    assert.doesNotMatch(breakingJob, /^\s+if:/m, 'proto-breaking must run for fork pull requests');
+    const [checkoutStep] = workflowStepBlocksByUses(breakingJob, 'actions/checkout');
+    assert.match(
+      checkoutStep,
+      /\n\s+with:\n\s+fetch-depth: 0\n/,
+      'proto-breaking must fetch full history so the main baseline is available',
+    );
+    const breakingStep = workflowStepBlock(protoCheckWorkflow, 'Check for breaking proto changes');
+    assert.match(
+      breakingStep,
+      /^\s+run: make breaking\s*$/m,
+      'proto-check.yml must run the canonical buf breaking target against the fetched origin/main proto baseline',
+    );
+    assert.doesNotMatch(breakingStep, /^\s+continue-on-error:/m);
+
+    // Pin the shared Makefile baseline. `run: make breaking` alone stays green if the
+    // recipe regresses to proto/.git#branch=main (no repo) or loses origin/main.
+    const makefile = read(resolve(root, 'Makefile'));
+    assert.match(
+      makefile,
+      /^breaking:[^\n]*\n\tcd \$\(PROTO_DIR\) && buf breaking --against '\.\.\/\.git#branch=origin\/main,subdir=proto'\s*$/m,
+      "make breaking must use '../.git#branch=origin/main,subdir=proto' from PROTO_DIR",
+    );
+
+    // Pin the documented FILE/PACKAGE/WIRE_JSON policy (binary WIRE intentionally off).
+    const bufYaml = read(resolve(root, 'proto/buf.yaml'));
+    const breakingUse = bufYaml.match(/\nbreaking:\n(?:[^\n]*\n)*?[ \t]+use:\n((?:[ \t]+-[^\n]*\n)+)/);
+    assert.ok(breakingUse, 'proto/buf.yaml must declare breaking.use');
+    const rules = [...breakingUse[1].matchAll(/^[ \t]+-[ \t]+(\S+)\s*$/gm)].map((m) => m[1]).sort();
+    assert.deepEqual(
+      rules,
+      ['FILE', 'PACKAGE', 'WIRE_JSON'].sort(),
+      'breaking.use must be exactly FILE, PACKAGE, WIRE_JSON (binary WIRE intentionally omitted)',
+    );
+
+    // Path-filtered Proto Generation Check is outside deploy-gate's aggregated
+    // workflows (#5402). A red `proto-breaking` check-run does not fail the
+    // required `gate` context until it is wired into deploy-gate (with a
+    // path-safe always-run/skip pattern) or listed in branch-protection/rulesets.
+  });
+
   it('runs the public documentation boundary on docs-only pull requests', () => {
     const publicDocsJob = workflowJobBlock(lintCodeWorkflow, 'public-docs');
 
@@ -472,6 +561,39 @@ describe('CI workflow coverage', () => {
     assert.doesNotMatch(edgeBundleStep, /find api\//);
   });
 
+  it('routes Tauri config edits into the job that runs the one-binary gate (#5908)', () => {
+    // Executes the real awk from test.yml rather than string-matching it: a
+    // regex typo in the carve-out would silently exempt Tauri-config changes
+    // from CI while a source-text assertion stayed green — the same drift class
+    // #5908 was filed to fix. tests/desktop-one-binary-model.test.mjs runs in
+    // `unit`, which is gated on this `code` output.
+    const awkBlock = shellAwkAssignmentBlock('CODE');
+    const program = awkBlock.slice(awkBlock.indexOf("awk '") + 5, awkBlock.lastIndexOf("'"));
+    const codeFilterSays = (path: string) => {
+      const out = execFileSync('awk', [program], { input: `${path}\n`, encoding: 'utf8' });
+      return Number(out.trim()) > 0;
+    };
+
+    for (const path of [
+      'src-tauri/tauri.conf.json',
+      'src-tauri/tauri.tech.conf.json',
+      'src-tauri/profiles/commodity.json',
+      'api/download.js',
+      'src/config/variant.ts',
+      'scripts/desktop-package.mjs',
+      'package.json',
+      '.github/workflows/build-desktop.yml',
+    ]) {
+      assert.ok(codeFilterSays(path), `${path} must set code=true so the one-binary gate runs`);
+    }
+
+    // The carve-out must stay a carve-out: Rust and capability edits are still
+    // covered by desktop-config/desktop-rust, not by the full unit suite.
+    for (const path of ['src-tauri/Cargo.toml', 'src-tauri/src/main.rs', 'README.md', 'docs/desktop-app.mdx']) {
+      assert.ok(!codeFilterSays(path), `${path} must not set code=true`);
+    }
+  });
+
   it('keeps resilience validation bundle inputs in the CI change filter', () => {
     assert.ok(
       testWorkflow.includes('validation: ${{ steps.diff.outputs.validation }}'),
@@ -499,6 +621,20 @@ describe('CI workflow coverage', () => {
         `test.yml desktop_config filter must cover ${input}`,
       );
     }
+    assert.ok(
+      desktopConfigFilter.includes('/^\\.github\\/workflows\\/.*\\.ya?ml$/'),
+      'test.yml desktop_config filter must cover every workflow file for dynamic Tauri inventory',
+    );
+    assert.equal(
+      evaluateDesktopConfigFilter(desktopConfigFilter, ['.github/workflows/nightly.yaml']),
+      '1',
+      'desktop_config must trigger for a newly added workflow file',
+    );
+    assert.equal(
+      evaluateDesktopConfigFilter(desktopConfigFilter, ['src/app.ts']),
+      '0',
+      'desktop_config must not trigger for an unrelated source file',
+    );
     for (const input of REQUIRED_DESKTOP_RUST_INPUTS) {
       assert.ok(
         desktopRustFilter.includes(workflowRegexNeedle(input)),
@@ -510,6 +646,26 @@ describe('CI workflow coverage', () => {
       /if: needs\.changes\.outputs\.desktop_config == 'true'/,
       'desktop-config job must use the desktop_config change output',
     );
+    // Cargo.lock is the only thing that decides which crate versions ship, and
+    // no other job inspects it (security-audit covers npm lockfiles only), so
+    // dropping this step would let a cargo update silently reintroduce a known
+    // advisory — CVE-2026-42184 / #5518 is the case that motivated it.
+    const floorStep = workflowStepBlock(testWorkflow, 'Rust dependency security floors (#5518)');
+    assert.match(
+      floorStep,
+      /^\s+run: node scripts\/check-rust-security-floors\.mjs\s*$/m,
+      'desktop-config job must run the Rust dependency security-floor check',
+    );
+    // A presence-only assertion would stay green with the step neutered, so
+    // pin that it still fails the job (same guard the AppImage step carries).
+    assert.doesNotMatch(floorStep, /^\s+continue-on-error:/m);
+    const releaseFloorStep = workflowStepBlock(desktopBuildWorkflow, 'Rust dependency security floors (#5518)');
+    assert.match(
+      releaseFloorStep,
+      /^\s+run: node scripts\/check-rust-security-floors\.mjs\s*$/m,
+      'release workflow must verify the security floors of the lockfile it ships',
+    );
+    assert.doesNotMatch(releaseFloorStep, /^\s+continue-on-error:/m);
     assert.match(
       testJobBlock('desktop-rust'),
       /if: needs\.changes\.outputs\.desktop_rust == 'true'/,
@@ -524,6 +680,62 @@ describe('CI workflow coverage', () => {
       testJobBlock('unit'),
       /^\s+node scripts\/build-sidecar-handlers\.mjs\s*$/m,
       'unit job must run the sidecar handler bundle build',
+    );
+    // Desktop build env parity (#5905) runs in BOTH legs deliberately:
+    // desktop-config fires on workflow edits (build-desktop.yml is excluded
+    // from the `code` filter), while unit fires when src/ gains a new
+    // import.meta.env.VITE_ read. Dropping either leg reopens half the gap.
+    assert.match(
+      testJobBlock('desktop-config'),
+      /^\s+run: node scripts\/check-desktop-build-env\.mjs\s*$/m,
+      'desktop-config job must run the desktop build env parity check',
+    );
+    assert.match(
+      testJobBlock('unit'),
+      /^\s+run: node scripts\/check-desktop-build-env\.mjs\s*$/m,
+      'unit job must run the desktop build env parity check',
+    );
+    const releasePreflight = workflowStepBlock(desktopBuildWorkflow, 'Release client-env preflight (#5905)');
+    assert.match(releasePreflight, /\[ "\$\{\{ github\.event_name \}\}" = "push" \] \|\|/);
+    assert.match(releasePreflight, /\[ "\$\{\{ github\.event_name \}\}" = "workflow_dispatch" \]/);
+    assert.match(releasePreflight, /\[ "\$\{\{ github\.event\.inputs\.draft \}\}" != "true" \]/);
+    assert.doesNotMatch(releasePreflight, /VITE_VAPID_PUBLIC_KEY/);
+    const canaryPreflight = workflowStepBlock(desktopCanaryWorkflow, 'Client env preflight (#5905)');
+    assert.match(canaryPreflight, /requires non-empty client env/);
+    assert.match(canaryPreflight, /VITE_CLERK_PUBLISHABLE_KEY/);
+    assert.match(canaryPreflight, /VITE_CONVEX_URL/);
+    assert.doesNotMatch(canaryPreflight, /VITE_VAPID_PUBLIC_KEY/);
+    assert.throws(
+      () => runReleasePreflight(releasePreflight, 'push', '', ''),
+      (error) => error.status === 1,
+      'tag pushes must fail when client env secrets are empty',
+    );
+    assert.throws(
+      () => runReleasePreflight(releasePreflight, 'workflow_dispatch', 'false', ''),
+      (error) => error.status === 1,
+      'published manual dispatches must fail when client env secrets are empty',
+    );
+    assert.doesNotThrow(
+      () => runReleasePreflight(releasePreflight, 'workflow_dispatch', 'true', ''),
+      'draft manual dispatches may run with empty client env secrets',
+    );
+    assert.doesNotThrow(
+      () => runReleasePreflight(releasePreflight, 'push', '', 'configured'),
+      'populated tag releases must pass the client env preflight',
+    );
+    // #5908: one published desktop binary means exactly one local build script,
+    // so the env gate has one place to live. Asserting the absence of the
+    // per-variant scripts keeps this from silently covering less than it did —
+    // a reintroduced `desktop:build:tech` would otherwise never be gate-checked.
+    assert.match(
+      packageScripts['desktop:tauri:build'] ?? '',
+      /npm run desktop:check-env/,
+      'desktop:tauri:build must run the local desktop env gate',
+    );
+    assert.deepEqual(
+      Object.keys(packageScripts).filter((name) => /^desktop:(tauri:)?build:/.test(name)),
+      [],
+      'per-variant desktop build scripts were retired with the one-binary model (#5908)',
     );
     const releasePostProcess = workflowStepBlock(desktopBuildWorkflow, 'Strip GPU libraries from AppImage');
     assert.match(
@@ -564,6 +776,15 @@ describe('CI workflow coverage', () => {
       desktopCanarySmoke,
       /^\s+if grep -q "SIDECAR_FINAL_STATUS=alive" \/tmp\/display-server\.log 2>\/dev\/null; then\s*$/m,
       'desktop canary must gate success on final sidecar liveness',
+    );
+  });
+
+  it('runs workflow coverage when the release workflow changes', () => {
+    const codeFilter = shellAwkAssignmentBlock('CODE');
+    assert.doesNotMatch(
+      codeFilter,
+      /build-desktop\.yml/,
+      'build-desktop.yml changes must run the unit workflow-coverage assertions',
     );
   });
 

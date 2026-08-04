@@ -21,7 +21,7 @@ Classifications: `parity` · `intentional difference` · `blocked` · `n/a`.
 | Repo version | 2.10.0 (package.json = tauri.conf.json = Cargo.toml; `npm run version:check` green) | `scripts/sync-desktop-version.mjs` |
 | Newest published desktop release | v2.5.23, built from `e51058e17` (2026-03-01); no `-tech` tag has ever been published | GitHub releases; `gh run list` |
 | Release delta | ~5 months of `main` unreleased; the unified map-layer catalog (`src/config/map-layer-definitions.ts`, #943) postdates the release entirely | `git show e51058e17` — file absent |
-| Shipped-build capability loss | `build-desktop.yml` passes only `VITE_VARIANT`, `VITE_DESKTOP_RUNTIME`, `VITE_WS_API_URL`, `CONVEX_URL`. Missing `VITE_CLERK_PUBLISHABLE_KEY`, `VITE_CONVEX_URL` (the non-`VITE_` value never reaches the client bundle), `VITE_VAPID_PUBLIC_KEY`, `VITE_ENABLE_CYBER_LAYER` → sign-in, subscription entitlements, web push, and the Cyber Threats layer are all silently disabled in every CI-built desktop release | `.github/workflows/build-desktop.yml:206-211`; `src/services/clerk.ts:30-49,233-236`; `src/services/entitlements.ts:96-99`; `src/App.ts:155` |
+| Shipped-build capability loss | **Fixed by #5905**: all Tauri build steps now declare the desktop-required client `VITE_*` set (Clerk/Convex/cyber + relay/basemap parity keys; web-push VAPID remains intentionally excluded on Tauri), a two-way completeness gate (`scripts/check-desktop-build-env.mjs`, `npm run desktop:check-env`) blocks regressions, and tag-push or published manual releases hard-fail on empty client secrets. Capabilities activate once the repo secrets are provisioned (ops step in the #5905 PR). Historical state: only `VITE_VARIANT`, `VITE_DESKTOP_RUNTIME`, `VITE_WS_API_URL`, `CONVEX_URL` were passed — sign-in, subscription entitlements, web push, and the Cyber Threats layer were silently disabled in every CI-built release | `.github/workflows/build-desktop.yml` build-leg env blocks; `scripts/check-desktop-build-env.mjs` |
 | PR CI before #5902 gates | `src-tauri/` (non-sidecar) changes ran **zero** PR CI; `version:check` self-excluded from src-tauri-only diffs; sidecar handler bundling ran only at release time; the inline Rust tests had never run in CI | `test.yml` / `lint-code.yml` change filters |
 | PR CI after #5902 gates | `desktop-config` + `desktop-rust` jobs gate desktop-coupled paths; twice-weekly installed-app canary (`Desktop Canary (Linux)`) asserts launch, sidecar readiness, rendered content | this repo, Test workflow |
 
@@ -30,7 +30,7 @@ Classifications: `parity` · `intentional difference` · `blocked` · `n/a`.
 | Blocker | Issue | Status |
 | --- | --- | --- |
 | Tauri origin-confusion CVE-2026-42184 (CVSS 8.8): lockfile pins tauri 2.10.3, needs ≥ 2.11.1; `Cargo.toml` carries an unbounded `version = "2"` caret | #5518 | open — release-blocking security finding |
-| Desktop build env omits Clerk/Convex/VAPID/cyber `VITE_*` vars → sign-in, Pro, push, Cyber Threats dead in shipped builds | #5905 | open — release-blocking; also the real fix vector for half of #5829 |
+| Desktop build env omits Clerk/Convex/VAPID/cyber `VITE_*` vars → sign-in, Pro, push, Cyber Threats dead in shipped builds | #5905 | fix landed (env declared + completeness gate + release preflight); remaining ops step: provision the four new repo secrets, after which release builds hard-fail if they go empty again |
 | Linux secret storage fails without an activatable Secret Service; every keyring error in `SecretsCache::load_from_keychain` is silently swallowed (`if let Ok`), so users get an empty vault with zero diagnostics | #802 / #1905 | open — needs secure fallback + migration + diagnostics |
 | Released 2.5.23 lacks Internet Outages / Cyber Threats layers | #5829 | diagnosed — three compounding causes, see row below |
 | Desktop readiness/error diagnosability; `src/services/desktop-readiness.ts:64-65` still cites deleted `/api/risk-scores` routes in the Service Status UI; sidecar readiness is assumed on port-file timeout (`main.rs:1443-1452`) rather than verified | #1942 | open — reassess with this evidence |
@@ -80,7 +80,7 @@ current code does in a current desktop build — not the stale v2.5.23 binary.
 | Desktop-locked panels | `forecast`, `oref-sirens`, `telegram-intel` locked; `cii`, `strategic-risk`, `gdelt-intel`, `supply-chain` downgraded to enhanced | intentional difference (documented here as the fallback statement) | `src/config/panels.ts:32-36,64,118-119` |
 | Layers not loaded on desktop | AIS, Iran attacks, GPS jamming (premium/relay-dependent); military flights uses direct OpenSky w/ 15-min cache instead of proto RPC | intentional difference | `src/app/data-loader.ts:1050,1055,3138`; `src/services/military-flights.ts:63-72` |
 | Variant selection | Web: hostname. Desktop: `localStorage` override with in-app switching (reload in place), falling back to build-time `VITE_VARIANT` | intentional difference | `src/config/variant.ts:20-38`; `src/app/event-handlers.ts:1594-1598` |
-| Variant switcher scope | **GAP**: switcher accepts commodity/energy, but no desktop artifact, updater variant, or package path exists for them (updater knows full/tech/finance; packaging stops at full/tech) | blocked → #5908 | `variant.ts:23`; `src/app/desktop-updater.ts:15-21`; `scripts/desktop-package.mjs:23` |
+| Variant switcher scope | **Fixed by #5908**: the supported model is one published binary that switches all six variants in-app, so no variant needs its own artifact. `SITE_VARIANTS` is the single source of truth, and `/api/download` accepts exactly that set (plus the `world` alias), pinned by `tests/desktop-one-binary-model.test.mjs`. Historical state: the switcher accepted commodity/energy while the updater knew only full/tech/finance and packaging stopped at full/tech | parity | `src/config/variant.ts:7`; `api/download.js:26-34`; `tests/desktop-one-binary-model.test.mjs` |
 | Runtime-config panel | Force-enabled on desktop boot; hidden on web | intentional difference | `src/App.ts:881-892`; `src/settings-window.ts:63` |
 | Runtime detection | **GAP (cosmetic/dev)**: two detectors disagree — `isDesktopRuntime()` (VITE flag + broad heuristics) vs raw `__TAURI__` checks in 6 files; split-brain under `desktop:dev` early boot and `VITE_DESKTOP_RUNTIME=1` browser builds | blocked (minor) → #5912 | `src/services/runtime.ts:72-113`; `src/config/variant.ts:20` |
 
@@ -91,7 +91,8 @@ current code does in a current desktop build — not the stale v2.5.23 binary.
 | Clerk sign-in | No desktop gating in code; CSP allowlists Clerk — but **dead in shipped builds** (missing `VITE_CLERK_PUBLISHABLE_KEY`) | blocked → #5905 | `src/services/clerk.ts:30-49,233-236`; `src-tauri/tauri.conf.json:32` |
 | Convex entitlements | Same pattern: `VITE_CONVEX_URL` missing from the desktop build (workflow passes non-`VITE_` `CONVEX_URL`, which never reaches the client) | blocked → #5905 | `src/services/entitlements.ts:96-99`; `vite.config.ts` (no define) |
 | Premium access | `WORLDMONITOR_API_KEY` from keyring is the only working Pro path in shipped builds; sidecar attaches the key natively (renderer skip is by design) | parity for key users; blocked for subscribers | `src/services/panel-gating.ts:53-58`; `src/services/premium-fetch.ts:223-237` |
-| Billing portal / checkout | **GAP**: `openBillingPortal()` and `startCheckout()` have no desktop branch — they navigate/pop the WebView instead of `open_url` to the OS browser; checkout return URL is built from `window.location.origin` (a `tauri://`/localhost origin on desktop); several upgrade entry points likewise unguarded | blocked → #5911 | `src/services/billing.ts:338-357`; `src/services/checkout.ts:886,1048-1051` |
+| Billing portal / checkout | Every billing, checkout and upgrade exit routes through `openExternalUrl`, which hands the URL to the OS browser via `open_url` on desktop (5s timeout, Sentry-reported failure, scheme-checked) and reports whether the handoff actually happened, so a failed open surfaces as a checkout error instead of a false "check your browser". The return URL is built from the canonical web origin; the app unlocks over the live Convex entitlement watch with no redirect back in. `openBillingPortal` reports `open-failed` rather than `opened` when nothing opened, and the checkout toast names the OS browser only when the native handoff actually succeeded. All seven remaining renderer call sites were migrated (#6120). **Residual**: the returning browser cannot acknowledge the purchase (its `handleCheckoutReturn` needs a session-local attempt record the app holds) → #6121; a plain-`http://` external link still cannot leave the app, because the native allowlist is https-only → tracked separately | intentional difference (desktop pays in the browser) — #5911 | `src/services/external-navigation.ts`; `src/services/checkout-return-url.ts:resolveCheckoutReturnOrigin`; `src/services/checkout.ts` (`navigateToWebSurface` + hosted-checkout branch) |
+| Settings → Plan &amp; billing tab | **GAP**: the tab is not rendered at all on desktop — `isSignedIn` is hardcoded to `!isDesktopApp`, so `renderUpgradeSection` / `handleUpgradeClick` are unreachable there regardless of Clerk. Their desktop branches are correct (#5911) but currently dead | blocked → #6108 | `src/components/UnifiedSettings.ts:644,656` |
 | #5901 unified user menu | No desktop-specific handling; hosts the billing surface above; menu itself requires Clerk (so absent from shipped builds until the env fix lands) | inherits the two rows above | `src/app/event-handlers.ts:1963` (commit `53181fb71`) |
 | Locked-panel affordances | `isPanelEntitled` returns entitled for `premium:'locked'` on any desktop runtime; real gates use `hasPremiumAccess()` so leak is cosmetic (settings picker / CMD+K / analyst offer panels that render locked) | intentional-ish, cosmetic; noted for the desktop UX pass | `src/config/panels.ts:1243-1245`; `src/app/panel-layout.ts:2150` |
 
@@ -118,7 +119,7 @@ current code does in a current desktop build — not the stale v2.5.23 binary.
 
 | Capability | Desktop behavior vs web | Classification | Evidence |
 | --- | --- | --- | --- |
-| Update discovery | Custom 6-hourly poll of `api.worldmonitor.app/api/version` (no Tauri updater plugin, no signed update artifacts); per-arch download via `/api/download` | intentional mechanism; **blocked on correctness** — see #5908 (`-tech` tag would NaN-poison `isNewerVersion`; both endpoints read only `/releases/latest`) | `src/app/desktop-updater.ts:26,73-75,112-162`; `api/version.js:13`; `api/download.js` |
+| Update discovery | Custom 6-hourly poll of `api.worldmonitor.app/api/version` (no Tauri updater plugin, no signed update artifacts); per-arch download via `/api/download` | intentional mechanism; **correctness fixed by #5908** — one release line, so `/releases/latest` is the right read, and `isNewerDesktopVersion` reports an unparseable version as `version_unparsable` instead of NaN-collapsing it to a silent `no_update` | `src/app/desktop-updater.ts:25,66-95`; `src/utils/desktop-version.ts`; `api/version.js:13`; `api/download.js` |
 | Web push / service worker | Intentionally desktop-excluded (Tauri check) and doubly so via missing `VITE_VAPID_PUBLIC_KEY` | intentional difference — fallback: in-app alerts | `src/services/push-notifications.ts:42`; `src/main.ts:496` |
 | Breaking-news alerts | Run on desktop; posted via raw XHR to bypass the fetch interceptor | parity | `src/services/breaking-news-alerts.ts:214-228` |
 | Stale-bundle check | Web-only (desktop has the updater instead) | intentional difference | `src/main.ts:405` |
@@ -129,12 +130,14 @@ current code does in a current desktop build — not the stale v2.5.23 binary.
 Condensed from the release-infra audit; each row feeds a child issue or the
 release-candidate checklist:
 
-1. Variant release model structurally broken: `/api/version` + `/api/download`
-   read only `/releases/latest`; `-tech` tags build the **full** variant on tag
-   push; release-notes step targets the wrong tag; `workflow_dispatch` default
-   `draft: true` makes builds invisible to the endpoints; finance is advertised
-   (`api/download.js:21`, docs) but unbuildable (workflow + packager stop at
-   full/tech). → #5908.
+1. ~~Variant release model structurally broken~~ — **resolved by #5908.** The
+   supported model is now one published World Monitor binary with in-app variant
+   switching, so the endpoints' single-release read is correct by design. The
+   workflow keeps one build-leg pair and one tag (`v__VERSION__`), the AppImage
+   re-upload and release-notes step can no longer target different tags,
+   `workflow_dispatch` defaults to `draft: false` so a dispatched build is
+   actually served, and the unbuildable tech/finance packaging surface is gone.
+   `tests/desktop-one-binary-model.test.mjs` fails if any surface drifts back.
 2. Bundled Node 22.14.0 vs CI Node 24 everywhere; SHASUMS fetched without GPG
    verification. → #5909.
 3. README/docs drift: "Stable" label, missing Linux ARM64 row, `windows-exe`
@@ -164,6 +167,8 @@ release-candidate checklist:
   (127.0.0.1:46123 probe), or blank render; screenshots/logs always uploaded.
 - Cross-platform artifact builds + smoke remain on release candidates
   (`build-desktop.yml`).
-- Not yet covered (future candidates): build-env completeness check for the
-  `VITE_*` set the SPA requires; a route-table contract test asserting every
-  `server/worldmonitor/` domain has an explicit desktop-path decision.
+- Desktop build-env parity (`scripts/check-desktop-build-env.mjs`): discovers
+  every Tauri workflow, scans syntax-aware `VITE_*` property reads, and runs in
+  both the workflow-change and source-change CI legs; a route-table contract
+  test asserting every `server/worldmonitor/` domain has an explicit
+  desktop-path decision remains a future candidate.

@@ -58,7 +58,7 @@
 - **Local AI** — run everything with Ollama, no API keys required
 - **6 site variants** from a single codebase (world, tech, finance, commodity, happy, energy)
 - **Native desktop app** (Tauri 2) for macOS, Windows, and Linux
-- **25 languages** with native-language feeds and RTL support
+- **26 languages** with native-language feeds and RTL support
 
 For the full feature list, architecture, data sources, and algorithms, see the **[documentation](https://www.worldmonitor.app/docs/documentation)**.
 
@@ -71,7 +71,7 @@ All site variants and desktop binaries are built from a single codebase and ship
 | Surface | Status | Notes |
 |---------|--------|-------|
 | `worldmonitor.app`, `tech.`, `finance.`, `commodity.`, `happy.`, `energy.` | Stable | Public deployments built from this repo, actively maintained |
-| Desktop binaries (Windows / macOS Apple Silicon / macOS Intel / Linux AppImage) | Stable | One Tauri binary that switches variants in-app; current CI release targets are `full` and `tech` |
+| Desktop binaries (Windows / macOS Apple Silicon / macOS Intel / Linux AppImage) | Stable | One Tauri binary for every variant — install World Monitor and switch to tech, finance, commodity, energy, or happy in-app. There is deliberately no per-variant download |
 
 Issues filed against any of the above are triaged from the same backlog — see the [issues board](https://github.com/koala73/worldmonitor/issues) for currently-open work.
 

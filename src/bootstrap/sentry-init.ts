@@ -545,8 +545,20 @@ function buildSentryInitOptions(): Parameters<SentryNs['init']>[0] {
       // trampoline variant is WORLDMONITOR-TZ: a wallet extension's
       // `injected/hook.js` wraps `window.fetch` and the leaked rejection frame
       // surfaces as `Object.apply`, not `window.fetch`.
+      // Sentry renders a frame reached through an aliased property as
+      // `<name> [<annotation>]` — an extension that stashes the original fetch
+      // under its own property surfaces as `window.fetch [<annotation>]`. The
+      // anchored match below needs the bare name, so strip one trailing
+      // bracketed annotation first; the meaningful identity is the name BEFORE
+      // the bracket, so a frame merely stored under a fetch-ish alias still
+      // fails the match (WORLDMONITOR-Y8, same Adjust extension as SG above).
+      // NB: deliberately written without spelling out the annotation keyword —
+      // the beforeSend unit-test harness strips `<keyword> <word>` sequences to
+      // drop TypeScript assertions and would mangle a regex that contained it
+      // (same harness trap as the Floot gate above).
+      const bareFrameFunction = (fn: string) => fn.replace(/\s*\[[^\]]*\]$/, '');
       if (/^(?:TypeError: )?Failed to fetch$/.test(msg)
-          && frames.some(f => /^(?:chrome|moz|safari(?:-web)?)-extension:\/\//.test(f.filename ?? '') && /^(?:(?:.*\.)?window\.|(?:window|Object)\.)?(?:fetch|apply)$/i.test(f.function ?? ''))) {
+          && frames.some(f => /^(?:chrome|moz|safari(?:-web)?)-extension:\/\//.test(f.filename ?? '') && /^(?:(?:.*\.)?window\.|(?:window|Object)\.)?(?:fetch|apply)$/i.test(bareFrameFunction(f.function ?? '')))) {
         return null;
       }
       // Bare `Failed to fetch` surfacing through the DebugBear RUM collector's
@@ -573,12 +585,24 @@ function buildSentryInitOptions(): Parameters<SentryNs['init']>[0] {
       // wrapper class re-surfaced as a new issue. The prefix is bounded to a
       // minified identifier (≤3 chars) so a real named receiver — e.g.
       // `apiClient.fetch` — is still read as a genuine caller and surfaces.
+      // WORLDMONITOR-Y4 is the third build-rename of the same wrapper: Vite
+      // emitted one hop of the trampoline as a BARE minified name (`t`) with no
+      // `fetch` in it at all, which no fetch-anchored pattern can match. Bare
+      // names are admitted only at ≤2 chars and only inside these two chunks —
+      // `fetchContent` (WORLDMONITOR-SG) and `apiClient.fetch` both stay above
+      // that bound and still surface, which their regression tests assert. What
+      // keeps the tolerance honest is that neither module backing these chunks
+      // issues a fetch of its own, so a bare minified frame in them cannot be
+      // the real caller; tests/debugbear-trampoline-chunks.test.mjs fails if
+      // either module ever gains one, rather than letting the gate rot silently.
+      const isTrampolineFrameFunction = (fn: string) =>
+        /^(?:\w{1,3}\.)?(?:window\.)?fetch$/.test(fn) || /^\w{1,2}$/.test(fn);
       if (/^(?:TypeError: )?Failed to fetch$/.test(msg)
           && frames.some(f => isDebugBearRumScriptFrame(f.filename ?? ''))
           && nonInfraFrames.every(f =>
             isDebugBearRumScriptFrame(f.filename ?? '')
             || (/\/assets\/(?:panel-storage|widget-store)-[A-Za-z0-9_-]+\.js/.test(f.filename ?? '')
-              && /^(?:\w{1,3}\.)?(?:window\.)?fetch$/.test(f.function ?? '')))) {
+              && isTrampolineFrameFunction(f.function ?? '')))) {
         return null;
       }
       // Suppress Sentry SDK DOM breadcrumb null-access on document.activeElement/contains.
@@ -611,6 +635,22 @@ function buildSentryInitOptions(): Parameters<SentryNs['init']>[0] {
       // pattern above) so an unrelated exception with a FireglassUtils frame
       // isn't silently dropped (WORLDMONITOR-MK).
       if (excType === 'RangeError' && frames.some(f => /FireglassUtils/.test(f.function ?? ''))) return null;
+      // `Maximum call stack size exceeded` with a COMPLETELY empty stack, only on
+      // iOS. A blown stack is exactly the case where the SDK cannot collect
+      // frames, so zero frames alone proves nothing — the platform census is what
+      // does. WORLDMONITOR-WK is 23 events across 20 users and 100% iOS, 21 of
+      // them inside the Google app's in-app WebView (the rest Chrome iOS); zero
+      // desktop, zero Android, one release. Our own bundle is the same code on
+      // every platform, so a genuine first-party recursion cannot be confined to
+      // one iOS WebView family — these are the host app's injected scripts
+      // recursing (the Fireglass gate above is the same class, caught by name).
+      // Triple-gated: any frame at all, any first-party frame, or any non-iOS OS
+      // and a real recursion regression still surfaces.
+      if (excType === 'RangeError'
+          && frames.length === 0
+          && !hasFirstParty
+          && /^Maximum call stack size exceeded\.?$/.test(msg)
+          && /^(iOS|iPadOS)$/.test(((event.contexts as any)?.os?.name as string) ?? '')) return null;
       // Suppress Chrome Mobile WebView 105+ Request constructor quirk ONLY when
       // the Dodo checkout lazy chunk is in the stack (WORLDMONITOR-MH). The
       // exact message is unique to the Fetch § Request() duplex requirement, but

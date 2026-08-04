@@ -1,7 +1,17 @@
 import { getCorsHeaders, isDisallowedOrigin } from './_cors.js';
 import { validateApiKey } from './_api-key.js';
 import { jsonResponse } from './_json-response.js';
+import {
+  hasPoolCoverageShortfall,
+  parsePoolCounts,
+  PREDICTION_MARKET_MIN_POOL_COUNTS,
+} from './_pool-coverage.js';
 import { unwrapEnvelope } from './_seed-envelope.js';
+import { projectChinaDecisionGroupDiagnostics } from './_china-decision-health.js';
+import {
+  buildContentFreshnessAssessment,
+  projectContentFreshnessForWire,
+} from './_content-freshness.js';
 // @ts-expect-error — JS module, no declaration file
 import { redisPipeline } from './_upstash-json.js';
 
@@ -29,39 +39,12 @@ const CHINA_DECISION_SIGNAL_STATES = new Set([
   'stale',
   'unavailable',
 ]);
-
-function projectChinaDecisionGroupDiagnostics(meta) {
-  const states = meta?.groupStates;
-  const counts = meta?.groupCounts;
-  if (
-    !states
-    || typeof states !== 'object'
-    || Array.isArray(states)
-    || !counts
-    || typeof counts !== 'object'
-    || Array.isArray(counts)
-  ) return null;
-  const groupStates = Object.fromEntries(
-    CHINA_DECISION_SIGNAL_GROUP_IDS.map((groupId) => [groupId, states[groupId]]),
-  );
-  if (
-    Object.values(groupStates).some((state) => !CHINA_DECISION_SIGNAL_STATES.has(state))
-    || !['populated', 'partial', 'stale', 'unavailable'].every(
-      (key) => Number.isInteger(counts[key])
-        && counts[key] >= 0
-        && counts[key] <= CHINA_DECISION_SIGNAL_GROUP_IDS.length,
-    )
-  ) return null;
-  return {
-    groupStates,
-    groupCounts: {
-      populated: counts.populated,
-      partial: counts.partial,
-      stale: counts.stale,
-      unavailable: counts.unavailable,
-    },
-  };
-}
+// #6060: the one unavailable cause that is operational coverage rather than a
+// source failure. Mirrors CHINA_DECISION_SIGNAL_COVERED_UNAVAILABLE_CAUSE in
+// scripts/seed-china-decision-signals.mjs.
+const CHINA_DECISION_HEALTHY_QUIET_CAUSE = 'healthy_quiet_window';
+const PORTWATCH_CONTENT_FRESHNESS_ACTIVATION_KEY =
+  'seed-activated:supply_chain:portwatch-ports:content-freshness';
 
 const SEED_DOMAINS = {
   'health:china-coverage':    { key: 'seed-meta:health:china-coverage',    intervalMin: 60, activationKey: 'seed-activated:health:china-coverage' },
@@ -131,12 +114,20 @@ const SEED_DOMAINS = {
   'military:cross-strait-activity:japan-mod': { key: 'seed-meta:military:cross-strait-activity:japan-mod', intervalMin: 180 },
   'military:defense-patents': { key: 'seed-meta:military:defense-patents', intervalMin: 12600 },
   'military-forecast-inputs': { key: 'seed-meta:military-forecast-inputs', intervalMin: 8 },
+  'military-surges':         { key: 'seed-meta:military-surges',         intervalMin: 8 },
   'infra:service-statuses':   { key: 'seed-meta:infra:service-statuses',   intervalMin: 60 },
   'supply_chain:shipping':    { key: 'seed-meta:supply_chain:shipping',    intervalMin: 120 },
   'supply_chain:chokepoints': { key: 'seed-meta:supply_chain:chokepoints', intervalMin: 30 },
   'cable-health':             { key: 'seed-meta:cable-health',             intervalMin: 30 },
   'infrastructure:submarine-cables': { key: 'seed-meta:infrastructure:submarine-cables', intervalMin: 12600 },
-  'prediction:markets':       { key: 'seed-meta:prediction:markets',       intervalMin: 8, minRecordCount: 20 }, // minRecordCount mirrors api/health.js (#5733)
+  'prediction:markets': {
+    key: 'seed-meta:prediction:markets',
+    intervalMin: 8,
+    minRecordCount: 20,
+    // Mirrors api/health.js (#5875). A one-market floor detects an empty pool
+    // without asserting that a naturally quiet category must sustain volume.
+    minPoolCounts: PREDICTION_MARKET_MIN_POOL_COUNTS,
+  },
   'aviation:intl':            { key: 'seed-meta:aviation:intl',            intervalMin: 45 }, // intervalMin*2 = 90min staleness. seed-aviation's freshness gate (AVIATIONSTACK_MIN_REFRESH_MIN, default 55) lets fetchedAt age to ~55+cron between paid fetches; 90min matches the aviation:faa sibling + api/health.js intlDelays maxStaleMin:90. Was 15 (30min) and false-WARNed every cycle once the gate landed.
   'theater-posture':          { key: 'seed-meta:theater-posture',          intervalMin: 8 },
   'economic:worldbank-techreadiness': { key: 'seed-meta:economic:worldbank-techreadiness:v1', intervalMin: 5040 },
@@ -165,6 +156,7 @@ const SEED_DOMAINS = {
   'thermal:escalation':       { key: 'seed-meta:thermal:escalation',       intervalMin: 180 },
   'radiation:observations':   { key: 'seed-meta:radiation:observations',   intervalMin: 15 },
   'sanctions:pressure':       { key: 'seed-meta:sanctions:pressure',       intervalMin: 360 },
+  'sanctions:entities':       { key: 'seed-meta:sanctions:entities',       intervalMin: 360 },
   'health:air-quality':       { key: 'seed-meta:health:air-quality',       intervalMin: 60 },  // hourly cron (shared seeder writes health + climate keys)
   'economic:grocery-basket':  { key: 'seed-meta:economic:grocery-basket',  intervalMin: 5040 }, // weekly seed; intervalMin = maxStaleMin / 2
   'economic:bigmac':          { key: 'seed-meta:economic:bigmac',          intervalMin: 5040 }, // weekly seed; intervalMin = maxStaleMin / 2
@@ -194,7 +186,16 @@ const SEED_DOMAINS = {
   'product-catalog':          { key: 'seed-meta:product-catalog',          intervalMin: 360 }, // relay loop every 6h; intervalMin = health.js maxStaleMin / 3 (1080 / 3)
   'portwatch:chokepoints-ref': { key: 'seed-meta:portwatch:chokepoints-ref', intervalMin: 10080 },
   'portwatch:disruptions':    { key: 'seed-meta:portwatch:disruptions',    intervalMin: 75 }, // active disruptions seed; intervalMin*2 = 150min matches api/health.js
-  'supply_chain:portwatch-ports': { key: 'seed-meta:supply_chain:portwatch-ports', intervalMin: 720, minRecordCount: 174 }, // 12h cron (0 */12 * * *); intervalMin = maxStaleMin / 3 (2160 / 3); #3613 requires 174-country coverage before OK.
+  // #6060: mirror /api/health's decision-critical content contract. The
+  // heartbeat and 174-country cardinality can both be green while CN/HK's
+  // cached observations are older than the corridor adapter's 144h budget.
+  'supply_chain:portwatch-ports': {
+    key: 'seed-meta:supply_chain:portwatch-ports',
+    intervalMin: 720,
+    minRecordCount: 174,
+    requireContentFreshness: { countries: ['CN', 'HK'], budgetMinutes: 2 * 72 * 60 },
+    contentFreshnessActivationKey: PORTWATCH_CONTENT_FRESHNESS_ACTIVATION_KEY,
+  }, // 12h cron (0 */12 * * *); intervalMin = maxStaleMin / 3 (2160 / 3); #3613 requires 174-country coverage before OK.
   'energy:chokepoint-flows': { key: 'seed-meta:energy:chokepoint-flows', intervalMin: 360 }, // 6h relay loop; intervalMin = maxStaleMin / 2 (720 / 2)
   'energy:eia-petroleum':   { key: 'seed-meta:energy:eia-petroleum',   intervalMin: 1440 }, // daily bundle cron; intervalMin*3 = health.js maxStaleMin (4320)
   'energy:spine':                 { key: 'seed-meta:energy:spine',                 intervalMin: 1440 }, // daily cron (0 6 * * *); intervalMin = maxStaleMin / 2 (2880 / 2)
@@ -378,6 +379,7 @@ async function getSeedBatch(entries) {
   const metaSlots = [];
   const probeSlots = [];
   const activationSlots = [];
+  const contentFreshnessActivationSlots = [];
   for (const [domain, cfg] of entries) {
     metaSlots.push({ domain, key: cfg.key, index: commands.length });
     commands.push(['GET', cfg.key]);
@@ -388,6 +390,10 @@ async function getSeedBatch(entries) {
     if (cfg.activationKey) {
       activationSlots.push({ domain, index: commands.length });
       commands.push(['EXISTS', cfg.activationKey]);
+    }
+    if (cfg.contentFreshnessActivationKey) {
+      contentFreshnessActivationSlots.push({ domain, index: commands.length });
+      commands.push(['EXISTS', cfg.contentFreshnessActivationKey]);
     }
   }
 
@@ -406,11 +412,24 @@ async function getSeedBatch(entries) {
   for (const slot of probeSlots) {
     probeMap.set(slot.domain, data[slot.index]?.result ?? null);
   }
+  // Both maps are THREE-valued (#6095, matching api/health.js and
+  // api/mcp/freshness.ts): an entry exists only when the EXISTS command itself
+  // succeeded. Upstash reports per-command failures as `error` inside an
+  // otherwise-successful 200, so a domain missing from these maps means "the
+  // read failed and the state is unknown" — distinguishable from a marker that
+  // was read and came back absent. Each consumer below decides which way
+  // unknown resolves, and they deliberately differ.
   const activatedMap = new Map();
   for (const slot of activationSlots) {
-    activatedMap.set(slot.domain, Number(data[slot.index]?.result) === 1);
+    const entry = data[slot.index];
+    if (entry && !entry.error) activatedMap.set(slot.domain, Number(entry.result) === 1);
   }
-  return { metaMap, probeMap, activatedMap };
+  const contentFreshnessActivatedMap = new Map();
+  for (const slot of contentFreshnessActivationSlots) {
+    const entry = data[slot.index];
+    if (entry && !entry.error) contentFreshnessActivatedMap.set(slot.domain, Number(entry.result) === 1);
+  }
+  return { metaMap, probeMap, activatedMap, contentFreshnessActivatedMap };
 }
 
 export default async function handler(req) {
@@ -430,9 +449,10 @@ export default async function handler(req) {
 
   let metaMap;
   let activatedMap = new Map();
+  let contentFreshnessActivatedMap = new Map();
   let probeMap;
   try {
-    ({ metaMap, probeMap, activatedMap } = await getSeedBatch(entries));
+    ({ metaMap, probeMap, activatedMap, contentFreshnessActivatedMap } = await getSeedBatch(entries));
   } catch {
     return jsonResponse({ error: 'Redis unavailable' }, 503, cors);
   }
@@ -444,26 +464,47 @@ export default async function handler(req) {
   for (const [domain, cfg] of entries) {
     const meta = metaMap.get(cfg.key);
     const maxStalenessMs = cfg.intervalMin * 2 * 60 * 1000;
+    // #6095 review: mirrors api/health.js's `activationUnknown`. A verdict
+    // reached from an UNREADABLE marker is otherwise byte-identical to one
+    // reached from evidence, so an operator cannot tell "the EXISTS command
+    // failed" from "the producer genuinely never published" — different
+    // remediations. Reports which evidence the verdict rests on; softens and
+    // hardens nothing on its own.
+    const activationUnknown = (cfg.activationKey && !activatedMap.has(domain))
+      || (cfg.contentFreshnessActivationKey && !contentFreshnessActivatedMap.has(domain));
 
     if (!meta) {
-      if (cfg.activationKey && !activatedMap.get(domain)) {
+      if (cfg.activationKey && activatedMap.get(domain) !== true) {
         // Never seeded (durable marker absent) AND operator-activation-
         // gated: healthy pending state, not an alarm (#4927 review P1).
         // Once the marker exists, missing meta falls through to
         // 'missing' — a publisher that ran once and died must alarm
         // (#4927 re-review P1).
+        // #6095 audited this grace and kept it soft on an UNREADABLE marker,
+        // unlike the content-freshness grace below, and mirrors the same call
+        // api/health.js makes for ON_DEMAND: the strict verdict here is
+        // 'missing' (which drives `overall: degraded` and HTTP 503), so
+        // resolving unknown to "activated" would turn a marker blip into a
+        // hard-down page for a domain that may genuinely never have run.
+        // There is no meta to be wrong about — absence is the whole input.
         seeds[domain] = { status: 'pending-activation', fetchedAt: null, recordCount: null, stale: false };
+        if (activationUnknown) seeds[domain].activationUnknown = true;
         continue;
       }
       seeds[domain] = { status: 'missing', fetchedAt: null, recordCount: null, stale: true };
       if (cfg.minRecordCount != null) seeds[domain].minRecordCount = cfg.minRecordCount;
+      if (cfg.minPoolCounts) seeds[domain].minPoolCounts = cfg.minPoolCounts;
       missingCount++;
       continue;
     }
 
     const ageMs = now - (meta.fetchedAt || 0);
     const recordCount = parseFiniteRecordCount(meta.recordCount);
-    const coveragePartial = cfg.minRecordCount != null && (recordCount == null || recordCount < cfg.minRecordCount);
+    const poolCounts = parsePoolCounts(meta.poolCounts, cfg.minPoolCounts);
+    const recordCoveragePartial = cfg.minRecordCount != null
+      && (recordCount == null || recordCount < cfg.minRecordCount);
+    const poolCoveragePartial = hasPoolCoverageShortfall(poolCounts, cfg.minPoolCounts);
+    const coveragePartial = recordCoveragePartial || poolCoveragePartial;
     // Source-specific seed projections retain their last-good records while
     // reporting a current upstream failure through sourceState. Treat that as
     // an immediate operator error instead of waiting for the freshness window.
@@ -486,8 +527,55 @@ export default async function handler(req) {
       meta.sourceVersion !== '' &&
       meta.sourceVersion !== cfg.dataProbe.sourceVersion
     );
-    const stale = ageMs > maxStalenessMs || coveragePartial || isError || sourceMismatch || probe?.ok === false;
-    if (stale) staleCount++;
+    const contentFreshness = buildContentFreshnessAssessment(
+      meta,
+      cfg.requireContentFreshness,
+      now,
+    );
+    // Grace requires POSITIVE proof (#6095): the marker was READ and came back
+    // absent. An unreadable marker is unknown state, not evidence of a producer
+    // that never ran — the same rule api/health.js and api/mcp/freshness.ts
+    // apply, so the three surfaces cannot answer differently for one input
+    // class. The opposite policy from the activation grace above, and for a
+    // reason: this one suppresses an alarm on a domain that HAS meta and IS
+    // running, and its strict verdict is 'coverage_degraded' — "cannot prove
+    // content freshness", which an unread marker makes literally true. A grace
+    // granted on the absence of evidence never expires, so an UNREADABLE marker
+    // would otherwise disable the alarm for good.
+    //
+    // Closes the unreadable arm ONLY: a marker that was evicted, renamed, or
+    // restored into an empty Redis returns a clean EXISTS=0 — the read-and-
+    // absent arm — and still grants the grace indefinitely. Tracked in #6111.
+    const contentFreshnessPending = Boolean(
+      contentFreshness
+      && !contentFreshness.fieldPresent
+      && cfg.contentFreshnessActivationKey
+      && contentFreshnessActivatedMap.get(domain) === false,
+    );
+    const contentFreshnessInvalid = Boolean(
+      cfg.requireContentFreshness
+      && contentFreshness
+      && !contentFreshness.usable
+      && !contentFreshnessPending,
+    );
+    const contentFreshnessStale = Boolean(
+      contentFreshness
+      && contentFreshness.usable
+      && contentFreshness.contentStale
+      && !contentFreshnessPending,
+    );
+    // Keep the new pool-coverage verdict distinct from freshness. The legacy
+    // scalar minRecordCount path still contributes to `stale` for wire
+    // compatibility, but an empty pool is fresh data with partial coverage.
+    const freshnessStale = ageMs > maxStalenessMs;
+    const stale = freshnessStale
+      || recordCoveragePartial
+      || isError
+      || sourceMismatch
+      || probe?.ok === false
+      || contentFreshnessInvalid
+      || contentFreshnessStale;
+    if (stale || poolCoveragePartial) staleCount++;
 
     seeds[domain] = {
       status: sourceUnavailable
@@ -498,13 +586,17 @@ export default async function handler(req) {
           ? 'source_version_mismatch'
           : probe?.ok === false
             ? probe.status
-            : coveragePartial
-              ? 'coverage_partial'
-              : stale
+            : freshnessStale
               ? 'stale'
-              : sourceBlocked
-                ? 'source_blocked'
-              : 'ok',
+              : coveragePartial
+                ? 'coverage_partial'
+                : contentFreshnessInvalid
+                  ? 'coverage_degraded'
+                  : contentFreshnessStale
+                    ? 'stale_content'
+                    : sourceBlocked
+                      ? 'source_blocked'
+                      : 'ok',
       fetchedAt: meta.fetchedAt,
       recordCount: recordCount ?? meta.recordCount ?? null,
       sourceVersion: meta.sourceVersion || null,
@@ -512,6 +604,15 @@ export default async function handler(req) {
       stale,
     };
     if (cfg.minRecordCount != null) seeds[domain].minRecordCount = cfg.minRecordCount;
+    if (cfg.minPoolCounts) seeds[domain].minPoolCounts = cfg.minPoolCounts;
+    if (activationUnknown) seeds[domain].activationUnknown = true;
+    if (poolCounts) seeds[domain].poolCounts = poolCounts;
+    if (contentFreshness && !contentFreshnessPending) {
+      seeds[domain].contentFreshness = projectContentFreshnessForWire(contentFreshness);
+    }
+    // Explicit coverage flag so consumers that only inspect `stale` still see
+    // pool/aggregate shortfalls (pool shortfall keeps stale:false by design).
+    if (coveragePartial) seeds[domain].coveragePartial = true;
     if (probe) seeds[domain].dataProbe = probe;
     // #5736: without this, `status: "error"` names no cause and an operator has
     // to read raw Redis to learn WHY — which is the log-diving the issue exists
@@ -524,7 +625,11 @@ export default async function handler(req) {
       seeds[domain].lastErrorCode = meta.lastErrorCode;
     }
     if (domain === 'intelligence:china-decision-signals') {
-      const diagnostics = projectChinaDecisionGroupDiagnostics(meta);
+      const diagnostics = projectChinaDecisionGroupDiagnostics(meta, {
+        groupIds: CHINA_DECISION_SIGNAL_GROUP_IDS,
+        allowedStates: CHINA_DECISION_SIGNAL_STATES,
+        healthyQuietCause: CHINA_DECISION_HEALTHY_QUIET_CAUSE,
+      });
       if (diagnostics) Object.assign(seeds[domain], diagnostics);
     }
   }

@@ -7,6 +7,7 @@ import { trackPanelResized } from '@/services/analytics';
 import { getAiFlowSettings } from '@/services/ai-flow-settings';
 import { getSecretState } from '@/services/runtime-config';
 import { PanelGateReason } from '@/services/panel-gating';
+import { openExternalUrl } from '@/services/external-navigation';
 import { lockSvg, upgradeSvg } from '@/components/gate-icons';
 import { dataFreshness, type PanelFreshnessSummary } from '@/services/data-freshness';
 import { formatPanelFreshnessDisplay } from '@/services/panel-freshness-display';
@@ -80,7 +81,12 @@ function getRowSpan(element: HTMLElement): number {
   if (element.classList.contains('span-4')) return 4;
   if (element.classList.contains('span-3')) return 3;
   if (element.classList.contains('span-2')) return 2;
-  return 1;
+  if (element.classList.contains('span-1')) return 1;
+  // A natural wide panel already occupies two dashboard rows even when it
+  // has no explicit span-N class. Treat that footprint as the resize baseline
+  // so the first vertical drag changes the visible height instead of being a
+  // no-op against the existing grid-row: span 2 rule.
+  return element.classList.contains('panel-wide') ? 2 : 1;
 }
 
 function deltaToRowSpan(startSpan: number, deltaY: number): number {
@@ -951,7 +957,9 @@ export class Panel {
 
     const ctaBtn = h('button', { type: 'button', className: 'panel-locked-cta' }, 'Upgrade to Pro');
     if (isDesktopRuntime()) {
-      ctaBtn.addEventListener('click', () => void invokeTauri<void>('open_url', { url: 'https://worldmonitor.app/pro' }).catch(() => window.open('https://worldmonitor.app/pro', '_blank', 'noopener,noreferrer')));
+      ctaBtn.addEventListener('click', () => {
+        void openExternalUrl('https://worldmonitor.app/pro');
+      });
     } else {
       ctaBtn.addEventListener('click', () => {
         import('@/services/checkout').then(m => import('@/config/products').then(p => m.startCheckout(p.DEFAULT_UPGRADE_PRODUCT))).catch(() => {
