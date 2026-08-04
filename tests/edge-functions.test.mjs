@@ -14,6 +14,22 @@ const scriptsSharedDir = join(root, 'scripts', 'shared');
 
 const trackedApiSources = listTrackedApiSourceFiles(root);
 
+// Both api-wide guards below register one `it()` PER DISCOVERED FILE, so an
+// empty discovery makes them emit zero assertions and this suite reports green
+// while checking nothing — a `node:` import smuggled into an edge function
+// would ship unnoticed. `git ls-files` exits 0 with empty output whenever the
+// pathspec matches nothing, so that is reachable; the previous readdirSync
+// implementation threw instead. Fail closed, mirroring the checker's own
+// zero-entry guard.
+describe('tracked api/ discovery', () => {
+  it('finds at least one tracked api/ source', () => {
+    assert.ok(
+      trackedApiSources.length > 0,
+      'listTrackedApiSourceFiles returned nothing — the guards below would pass vacuously',
+    );
+  });
+});
+
 // Legacy JS entrypoints at api/ and api/oauth/ have stricter isolation rules.
 const allEdgeFunctions = trackedApiSources
   .filter((file) => file.endsWith('.js'))
