@@ -8,7 +8,7 @@ import type {
 } from '../../../../src/generated/server/worldmonitor/military/v1/service_server';
 
 import { isMilitaryCallsign, isMilitaryHex, detectAircraftType, UPSTREAM_TIMEOUT_MS } from './_shared';
-import { cachedFetchJson, getRawJson } from '../../../_shared/redis';
+import { cachedFetchJson, getRawJson, readCachedJson } from '../../../_shared/redis';
 import { markNoCacheResponse } from '../../../_shared/response-headers';
 import { getRelayBaseUrl, getRelayHeaders } from '../../../_shared/relay';
 
@@ -25,6 +25,41 @@ interface RequestBounds {
   north: number;
   west: number;
   east: number;
+}
+
+// Coverage is a property of the SNAPSHOT, not of the producer's query shape.
+//
+// scripts/seed-military-flights.mjs issues one bbox-less OpenSky /states/all per
+// run (#6222), but its tier-1 source (Wingbits) still queries the two regional
+// boxes below. So a cycle where OpenSky returned nothing publishes REGIONAL data
+// however global the intent was. Treating that as global would answer a viewport
+// over the Americas with an authoritative empty for the entire duration of an
+// OpenSky outage, instead of falling through to per-viewer recovery — the exact
+// "uncovered geography becomes an empty result" failure this guard exists to stop.
+//
+// The producer therefore stamps its real coverage into the payload and this reads
+// it. A payload without the field predates that change and is treated as regional,
+// which is the conservative reading during rollout.
+const GLOBAL_COVERAGE: readonly RequestBounds[] = [
+  { south: -90, north: 90, west: -180, east: 180 },
+];
+
+// The producer's tier-1 (Wingbits) query regions — mirrors QUERY_REGIONS in
+// scripts/seed-military-flights.mjs. This is what a snapshot covers when the
+// global tier contributed nothing.
+const REGIONAL_COVERAGE: readonly RequestBounds[] = [
+  { south: 10, north: 46, west: 107, east: 143 },
+  { south: 13, north: 85, west: -10, east: 57 },
+];
+
+function seedCovers(coverage: SeedCoverage, bounds: RequestBounds): boolean {
+  const regions = coverage === 'global' ? GLOBAL_COVERAGE : REGIONAL_COVERAGE;
+  return regions.some((region) =>
+    region.south <= bounds.south
+    && region.north >= bounds.north
+    && region.west <= bounds.west
+    && region.east >= bounds.east
+  );
 }
 
 
@@ -126,7 +161,7 @@ const CONFIDENCE_MAP: Record<string, string> = {
   low: 'MILITARY_CONFIDENCE_LOW',
 };
 
-interface StaleFlight {
+interface SeedFlight {
   id?: string;
   callsign?: string;
   hexCode?: string;
@@ -152,9 +187,13 @@ interface StaleFlight {
   note?: string;
 }
 
-interface StalePayload {
-  flights?: StaleFlight[];
+/** What geography a published snapshot actually covers — see seedCovers above. */
+type SeedCoverage = 'global' | 'regional';
+
+interface SeedPayload {
+  flights?: SeedFlight[];
   fetchedAt?: number;
+  coverage?: SeedCoverage;
 }
 
 /**
@@ -164,7 +203,7 @@ interface StalePayload {
  * hexCode is canonicalized to uppercase per the invariant documented on
  * MilitaryFlight.hex_code in military_flight.proto.
  */
-function staleToProto(f: StaleFlight): ListMilitaryFlightsResponse['flights'][number] | null {
+function seedToProto(f: SeedFlight): ListMilitaryFlightsResponse['flights'][number] | null {
   if (f.lat == null || f.lon == null) return null;
   const icao = (f.hexCode || f.id || '').toUpperCase();
   if (!icao) return null;
@@ -195,6 +234,54 @@ function staleToProto(f: StaleFlight): ListMilitaryFlightsResponse['flights'][nu
   };
 }
 
+function seedPayloadToProto(raw: SeedPayload | null): ListMilitaryFlightsResponse['flights'] | null {
+  if (!raw || !Array.isArray(raw.flights)) return null;
+  if (raw.flights.length === 0) return [];
+  const flights = raw.flights
+    .map(seedToProto)
+    .filter((flight): flight is NonNullable<typeof flight> => flight != null);
+  return flights.length > 0 ? flights : null;
+}
+
+const LIVE_SEED_NEG_TTL_MS = 30_000;
+let liveSeedNegUntil = 0;
+let liveSeedNegStatus: 'miss' | 'error' = 'miss';
+type LiveSeedRead =
+  | { status: 'hit'; flights: ListMilitaryFlightsResponse['flights']; coverage: SeedCoverage }
+  | { status: 'miss' | 'error' };
+let liveSeedReadPromise: Promise<LiveSeedRead> | null = null;
+
+async function fetchLiveSeedSnapshot(): Promise<LiveSeedRead> {
+  const now = Date.now();
+  if (now < liveSeedNegUntil) return { status: liveSeedNegStatus };
+  if (liveSeedReadPromise) return liveSeedReadPromise;
+
+  liveSeedReadPromise = (async () => {
+    const read = await readCachedJson(REDIS_CACHE_KEY, true);
+    if (read.status === 'error') {
+      liveSeedNegStatus = 'error';
+      liveSeedNegUntil = now + LIVE_SEED_NEG_TTL_MS;
+      return { status: 'error' };
+    }
+    const payload = read.status === 'hit' ? (read.value as SeedPayload) : null;
+    const flights = payload ? seedPayloadToProto(payload) : null;
+    if (flights === null) {
+      liveSeedNegStatus = 'miss';
+      liveSeedNegUntil = now + LIVE_SEED_NEG_TTL_MS;
+      return { status: 'miss' };
+    }
+    // An absent field predates the producer stamping coverage; regional is the
+    // conservative reading, and it is what the payload actually covered then.
+    const coverage: SeedCoverage = payload?.coverage === 'global' ? 'global' : 'regional';
+    return { status: 'hit', flights, coverage };
+  })();
+  try {
+    return await liveSeedReadPromise;
+  } finally {
+    liveSeedReadPromise = null;
+  }
+}
+
 // Negative cache for the stale Redis read — mirrors the legacy
 // /api/military-flights handler's NEG_TTL=30_000ms. When the live fetch fails
 // AND the stale key is also empty/unparseable, suppress further Redis reads
@@ -207,6 +294,9 @@ let staleNegUntil = 0;
 // Test seam — exposed for unit tests that need to drive the suppression
 // window without sleeping. Not exported from the module's public API.
 export function _resetStaleNegativeCacheForTests(): void {
+  liveSeedNegUntil = 0;
+  liveSeedNegStatus = 'miss';
+  liveSeedReadPromise = null;
   staleNegUntil = 0;
 }
 
@@ -214,15 +304,9 @@ async function fetchStaleFallback(): Promise<ListMilitaryFlightsResponse['flight
   const now = Date.now();
   if (now < staleNegUntil) return null;
   try {
-    const raw = (await getRawJson(REDIS_STALE_KEY)) as StalePayload | null;
-    if (!raw || !Array.isArray(raw.flights) || raw.flights.length === 0) {
-      staleNegUntil = now + STALE_NEG_TTL_MS;
-      return null;
-    }
-    const flights = raw.flights
-      .map(staleToProto)
-      .filter((f): f is NonNullable<typeof f> => f != null);
-    if (flights.length === 0) {
+    const raw = (await getRawJson(REDIS_STALE_KEY)) as SeedPayload | null;
+    const flights = seedPayloadToProto(raw);
+    if (!flights || flights.length === 0) {
       staleNegUntil = now + STALE_NEG_TTL_MS;
       return null;
     }
@@ -259,6 +343,33 @@ export async function listMilitaryFlights(
       cacheKey,
       REDIS_CACHE_TTL,
       async () => {
+        // The scheduled seeder is the single routine authenticated OpenSky
+        // writer. Cache its unpaginated regional snapshot under the existing
+        // bbox key so every cursor reads one stable version. Requests outside
+        // the producer's declared coverage continue to request-specific
+        // recovery instead of receiving a falsely authoritative empty result.
+        // The producer deliberately preserves its last-good snapshot during an
+        // upstream outage. Keep serving that snapshot (with each flight's old
+        // lastSeenAt intact) while seed health reports the stale fetchedAt;
+        // reopening per-viewer OpenSky recovery here recreates the credit fanout.
+        // Read first, THEN judge coverage: what the snapshot covers is a property
+        // of the payload (the producer stamps it), not of this module's constants.
+        const seeded = await fetchLiveSeedSnapshot();
+        if (seeded.status === 'error') {
+          // A Redis command/read failure is not proof the snapshot is
+          // missing. Throw before any provider call so cachedFetchJson's
+          // bounded negative path prevents per-bbox OpenSky amplification.
+          // The outer catch consults the 24h stale key before giving up.
+          throw new Error('military live seed read failed');
+        }
+        if (seeded.status === 'hit' && seedCovers(seeded.coverage, requestBounds)) {
+          return { flights: seeded.flights, clusters: [], pagination: undefined };
+        }
+        // A miss, or a hit whose coverage does not contain this request (a
+        // regional snapshot asked about the Americas), falls through to
+        // request-specific recovery rather than returning a falsely
+        // authoritative empty.
+
         const isSidecar = (process.env.LOCAL_API_MODE || '').includes('sidecar');
         const relayBase = isSidecar ? null : getRelayBaseUrl();
         const baseUrl = isSidecar ? 'https://opensky-network.org/api/states/all' : relayBase ? relayBase + '/opensky' : null;
@@ -350,6 +461,22 @@ export async function listMilitaryFlights(
     }
     return paginateResponse(fullResult.flights, fullResult.clusters, requestBounds, req);
   } catch {
+    // Reaching here means the live path was abandoned before any provider call —
+    // most often the deliberate 'live seed read failed' throw above, which exists
+    // to keep a Redis blip from opening per-bbox OpenSky amplification.
+    //
+    // That throw skipped the `if (!fullResult)` stale branch below, so the 24h
+    // stale key was never consulted. Reading it is another Redis GET, not a
+    // provider call, so it spends no OpenSky credit and is precisely what that
+    // key exists for. This matters much more since #6222 widened
+    // LIVE_SEED_COVERAGE to global: every viewport now routes through the
+    // live-seed read, so skipping stale here blanks the entire map rather than
+    // the two former producer regions. fetchStaleFallback swallows its own
+    // errors and returns null, so it cannot re-throw into this handler.
+    const staleFlights = await fetchStaleFallback();
+    if (staleFlights && staleFlights.length > 0) {
+      return paginateResponse(staleFlights, [], normalizeBounds(req), req);
+    }
     markNoCacheResponse(ctx.request);
     return emptyResponse();
   }

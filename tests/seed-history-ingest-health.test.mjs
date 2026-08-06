@@ -42,6 +42,7 @@ process.env.RESILIENCE_SCHEMA_V2_ENABLED = 'true';
 
 const RESILIENCE_INTERVAL_PROBE_KEY = 'resilience:intervals:v9:US';
 const RESILIENCE_INTERVAL_METHODOLOGY = 'weight-perturbation-sensitivity-v3';
+const PORTWATCH_META_KEY = 'seed-meta:supply_chain:portwatch-ports';
 const PORTWATCH_CONTENT_FRESHNESS_ACTIVATION_KEY =
   'seed-activated:supply_chain:portwatch-ports:content-freshness';
 
@@ -531,7 +532,7 @@ describe('recordHistoryIngestHealth', () => {
           JSON.stringify(retained),
         ]]),
         keyMetaErrors: new Map(),
-        activatedNames: new Set(['intelHistoryIngestConflictAcled']),
+        activationStates: new Map([['intelHistoryIngestConflictAcled', true]]),
         now: AT + (maxStaleMin + 1) * MINUTE,
       },
     );
@@ -850,7 +851,7 @@ describe('a prolonged relay rejection is visible in /api/health', () => {
       keyMetaErrors: new Map(),
       // Past the deployment window: softening is revoked, so this is the real
       // classification an operator would see in production.
-      activatedNames: new Set([collector.healthName]),
+      activationStates: new Map([[collector.healthName, true]]),
       now,
     };
 
@@ -906,7 +907,9 @@ describe('a prolonged relay rejection is visible in /api/health', () => {
         keyErrors: new Map(),
         keyMetaValues: new Map([[SEED_META[collector.healthName].key, null]]),
         keyMetaErrors: new Map(),
-        activatedNames: new Set(),   // marker absent: nothing has reported yet
+        // Marker READ and absent: nothing has reported yet (#6095 — an
+        // unreadable marker is a different, non-softening state).
+        activationStates: new Map([[collector.healthName, false]]),
         now: AT,
       };
 
@@ -920,7 +923,7 @@ describe('a prolonged relay rejection is visible in /api/health', () => {
         collector.healthName,
         ingestKey,
         { allowOnDemand: true },
-        { ...ctx, activatedNames: new Set([collector.healthName]) },
+        { ...ctx, activationStates: new Map([[collector.healthName, true]]) },
       );
       assert.equal(activated.status, 'EMPTY');
       assert.equal(healthTesting.STATUS_COUNTS.EMPTY, 'crit');
@@ -984,7 +987,7 @@ describe('a prolonged relay rejection is visible in /api/health', () => {
         keyErrors: new Map(),
         keyMetaValues: new Map([[SEED_META[collector.healthName].key, JSON.stringify(meta)]]),
         keyMetaErrors: new Map(),
-        activatedNames: new Set([collector.healthName]),
+        activationStates: new Map([[collector.healthName, true]]),
         now: AT + (maxStaleMin + 1) * MINUTE,
       };
 
@@ -1030,6 +1033,28 @@ describe('a prolonged relay rejection is visible in /api/seed-health', () => {
               _formula: 'pc',
               methodology: RESILIENCE_INTERVAL_METHODOLOGY,
               computedAt: '2026-06-11T12:00:00.000Z',
+            }),
+          };
+        }
+        if (key === PORTWATCH_META_KEY) {
+          const observedAt = Date.now() - 60 * 60_000;
+          return {
+            result: JSON.stringify({
+              fetchedAt: Date.now(),
+              recordCount: 174,
+              contentFreshness: {
+                coveredCount: 174,
+                freshCount: 174,
+                staleCount: 0,
+                unknownCount: 0,
+                staleCountries: [],
+                criticalCountries: ['CN', 'HK'],
+                criticalFreshCount: 2,
+                criticalStaleCountries: [],
+                criticalMissingCountries: 0,
+                criticalOldestObservedAt: observedAt,
+                criticalOldestObservedCountry: 'CN',
+              },
             }),
           };
         }

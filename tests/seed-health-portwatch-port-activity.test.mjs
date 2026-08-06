@@ -16,9 +16,11 @@ process.env.WORLDMONITOR_VALID_KEYS = 'test-key';
 process.env.RESILIENCE_PILLAR_COMBINE_ENABLED = 'true';
 process.env.RESILIENCE_SCHEMA_V2_ENABLED = 'true';
 
-const { default: handler } = await import('../api/seed-health.js');
+const { handleSeedHealth } = await import('../api/seed-health.js');
 
 const PORTWATCH_META_KEY = 'seed-meta:supply_chain:portwatch-ports';
+const PORTWATCH_CONTENT_BUDGET_MINUTES = 2 * 72 * 60;
+const TEST_NOW = Date.parse('2026-08-03T14:42:58.000Z');
 const DECISION_META_KEY = 'seed-meta:intelligence:china-decision-signals';
 const PREDICTION_META_KEY = 'seed-meta:prediction:markets';
 const RESILIENCE_INTERVAL_PROBE_KEY = 'resilience:intervals:v9:US';
@@ -42,7 +44,12 @@ after(() => {
 
 function installSeedHealthPipelineMock(
   portwatchRecordCount,
-  { missingPortwatchMeta = false, portwatchContentFreshness, chinaDecisionMeta } = {},
+  {
+    missingPortwatchMeta = false,
+    portwatchContentFreshness,
+    chinaDecisionMeta,
+    now = TEST_NOW,
+  } = {},
 ) {
   globalThis.fetch = async (_url, init) => {
     const commands = JSON.parse(init.body);
@@ -59,7 +66,7 @@ function installSeedHealthPipelineMock(
         if (missingPortwatchMeta) return { result: null };
         return {
           result: JSON.stringify({
-            fetchedAt: Date.now(),
+            fetchedAt: now,
             recordCount: portwatchRecordCount,
             ...(portwatchContentFreshness ? { contentFreshness: portwatchContentFreshness } : {}),
           }),
@@ -71,7 +78,7 @@ function installSeedHealthPipelineMock(
       if (key === PREDICTION_META_KEY) {
         return {
           result: JSON.stringify({
-            fetchedAt: Date.now(),
+            fetchedAt: now,
             recordCount: 38,
             poolCounts: { geopolitical: 18, tech: 12, finance: 8 },
           }),
@@ -91,7 +98,7 @@ function installSeedHealthPipelineMock(
       // This fixture isolates the PortWatch entry. Keep every unrelated
       // coverage-gated feed above its floor so a new minRecordCount contract
       // cannot turn the aggregate warning for an unrelated reason.
-      return { result: JSON.stringify({ fetchedAt: Date.now(), recordCount: 10_000 }) };
+      return { result: JSON.stringify({ fetchedAt: now, recordCount: 10_000 }) };
     });
     return new Response(JSON.stringify(results), {
       status: 200,
@@ -100,11 +107,11 @@ function installSeedHealthPipelineMock(
   };
 }
 
-async function readSeedHealth() {
+async function readSeedHealth(now = TEST_NOW) {
   const req = new Request('https://api.worldmonitor.app/api/seed-health', {
     headers: { 'X-WorldMonitor-Key': 'test-key' },
   });
-  const res = await handler(req);
+  const res = await handleSeedHealth(req, { now });
   const body = await res.json();
   return { res, body };
 }
@@ -166,10 +173,10 @@ test('seed-health keeps PortWatch port activity OK at the 174-country recovery f
 });
 
 test('seed-health flags stale decision-critical PortWatch content separately from heartbeat', async () => {
-  const now = Date.now();
+  const now = TEST_NOW;
   installSeedHealthPipelineMock(174, {
     portwatchContentFreshness: {
-      budgetMinutes: 4320,
+      budgetMinutes: PORTWATCH_CONTENT_BUDGET_MINUTES,
       coveredCount: 174,
       freshCount: 173,
       staleCount: 1,
@@ -178,7 +185,7 @@ test('seed-health flags stale decision-critical PortWatch content separately fro
       criticalFreshCount: 1,
       criticalStaleCountries: ['CN'],
       criticalMissingCountries: 0,
-      criticalOldestObservedAt: now - (73 * 60 * 60 * 1000),
+      criticalOldestObservedAt: now - (145 * 60 * 60 * 1000),
     },
   });
 
@@ -196,7 +203,7 @@ test('seed-health flags stale decision-critical PortWatch content separately fro
 test('seed-health publishes partial and stale China decision groups like /api/health', async () => {
   installSeedHealthPipelineMock(174, {
     chinaDecisionMeta: {
-      fetchedAt: Date.now(),
+      fetchedAt: TEST_NOW,
       recordCount: 3,
       groupStates: {
         macro: 'partial',

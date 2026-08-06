@@ -2262,6 +2262,14 @@ export class DataLoaderManager implements AppModule {
       }
 
       // Sector heatmap: always attempt loading regardless of market rate-limit status
+      // Symbols whose valuation was replayed from the seeder's last-good snapshot
+      // rather than fetched this cycle. Without this the panel would present
+      // records up to 7 days old as current.
+      const readStaleValuationSymbols = (resp: unknown): string[] => {
+        const coverage = (resp as { valuationCoverage?: { staleValuationSymbols?: unknown } })?.valuationCoverage;
+        const symbols = coverage?.staleValuationSymbols;
+        return Array.isArray(symbols) ? symbols.filter((s): s is string => typeof s === 'string') : [];
+      };
       const hydratedSectors = getHydratedData('sectors') as (GetSectorSummaryResponse & { valuations?: Record<string, SectorValuation> }) | undefined;
       const heatmapPanel = this.ctx.panels['heatmap'] as HeatmapPanel | undefined;
       const sectorNameMap = new Map(SECTORS.map((s) => [s.symbol, s.name]));
@@ -2283,7 +2291,10 @@ export class DataLoaderManager implements AppModule {
         const items = hydratedSectors.sectors.map(toHeatmapItem);
         const sectorBars = items.map(toSectorBar).filter((s): s is NonNullable<typeof s> => s !== null);
         heatmapPanel?.renderHeatmap(items, sectorBars.length ? sectorBars : undefined);
-        heatmapPanel?.updateValuations(hydratedSectors.valuations);
+        heatmapPanel?.updateValuations(
+          hydratedSectors.valuations,
+          readStaleValuationSymbols(hydratedSectors),
+        );
       } else {
         // If hydrated had sectors but no valuations field, render performance
         // tiles immediately so users see heatmap data while the live fetch runs.
@@ -2301,7 +2312,10 @@ export class DataLoaderManager implements AppModule {
           // payload without `valuations` must NOT clear prior valuations that
           // may already be rendered from a previous (successful) fetch.
           if (Object.prototype.hasOwnProperty.call(sectorsResp, 'valuations')) {
-            heatmapPanel?.updateValuations(sectorsResp.valuations);
+            heatmapPanel?.updateValuations(
+              sectorsResp.valuations,
+              readStaleValuationSymbols(sectorsResp),
+            );
           }
         } else if (stocksResult.skipped) {
           this.ctx.panels['heatmap']?.showConfigError(finnhubConfigMsg);
@@ -2374,18 +2388,14 @@ export class DataLoaderManager implements AppModule {
       // Load ECB FX rates for CommoditiesPanel FX tab
       if (commoditiesPanel) {
         try {
-          const { getEcbFxRatesData } = await import('@/services/economic');
+          const { getEcbFxRatesData, toEurSpotRows } = await import('@/services/economic');
           const fxResp = await getEcbFxRatesData();
           if (!fxResp.unavailable && fxResp.rates?.length) {
-            const EUR_FX_ORDER = ['USD', 'GBP', 'JPY', 'CHF', 'CAD', 'CNY', 'AUD'];
-            const orderedRates = EUR_FX_ORDER
-              .map(ccy => fxResp.rates.find(r => r.pair === `EUR${ccy}`))
-              .filter((r): r is NonNullable<typeof r> => r != null);
-            commoditiesPanel.updateFxRates(orderedRates.map(r => ({
-              currency: r.pair.slice(3), // EURUSD -> USD
-              rate: r.rate,
-              change1d: r.change1d ?? null,
-            })));
+            // Shared with the FX panel (#6199) so the pair list and its display
+            // order live in one place. This tab previously kept a private
+            // EUR_FX_ORDER literal; the two would have drifted the moment the
+            // seeder published an eighth pair.
+            commoditiesPanel.updateFxRates(toEurSpotRows(fxResp.rates));
           }
         } catch {
           // FX tab is optional, ignore failures
